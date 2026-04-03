@@ -306,6 +306,7 @@ def _build_episode(
     """Merge scalar metadata with decoded video frames for one episode."""
     ep_id = int(scalar_frames[0]["episode_index"])
     camera_frames = _fetch_episode_videos(dataset_id, ep_id, image_keys, fps)
+    scalar_frames = _expand_scalar_episode_rows(scalar_frames, camera_frames)
 
     result: list[dict] = []
     for i, row in enumerate(scalar_frames):
@@ -319,3 +320,42 @@ def _build_episode(
         result.append(frame)
 
     return result
+
+
+def _expand_scalar_episode_rows(
+    scalar_frames: list[dict],
+    camera_frames: dict[str, list[Image.Image]],
+) -> list[dict]:
+    """Expand episode-packed scalar rows into one row per frame when needed.
+
+    Some DROID dataset access paths expose a whole episode as a single row whose
+    scalar fields are sequences. The scorer and UI expect one dict per frame.
+    """
+    if len(scalar_frames) != 1:
+        return scalar_frames
+
+    row = scalar_frames[0]
+    frame_count = max((len(frames) for frames in camera_frames.values()), default=0)
+    if frame_count <= 1:
+        return scalar_frames
+
+    def pick(value, index: int):
+        if isinstance(value, list) and len(value) == frame_count:
+            return value[index]
+        if isinstance(value, tuple) and len(value) == frame_count:
+            return value[index]
+        if isinstance(value, dict):
+            projected = {k: pick(v, index) for k, v in value.items()}
+            return projected
+        return value
+
+    expanded: list[dict] = []
+    for i in range(frame_count):
+        frame = {k: pick(v, i) for k, v in row.items()}
+        raw_fi = row.get("frame_index")
+        if isinstance(raw_fi, (list, tuple)) and len(raw_fi) == frame_count:
+            frame["frame_index"] = int(raw_fi[i])
+        else:
+            frame["frame_index"] = i
+        expanded.append(frame)
+    return expanded

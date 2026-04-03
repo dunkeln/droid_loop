@@ -7,11 +7,16 @@
 
 	const API  = 'http://localhost:8000/api';
 	const FURL = (ep: number, fi: number) => `${API}/frames/${ep}_${fi}.jpg`;
+	const mediaUrl = (raw: string, rev = Date.now()) => {
+		const base = raw.startsWith('http') ? raw : `http://localhost:8000${raw}`;
+		return `${base}${base.includes('?') ? '&' : '?'}rev=${rev}`;
+	};
 
 	// ── Types ─────────────────────────────────────────────────────────────────
 	type Moment = {
 		episode_id: number; frame_index: number; cluster_id: number;
 		cluster_size?: number; cluster_span?: number[]; context_window?: number[]; label: string;
+		incident_span?: number[];
 	};
 	type FlaggedFrame = { frame_index: number; cluster_id: number; frame_url: string; };
 	type FrameView = { camera: string; frame_url: string; };
@@ -31,6 +36,13 @@
 		score: number;
 		cluster_id: number;
 		flagged: boolean;
+	};
+	type EpisodeScoreState = 'pending' | 'scoring' | 'ready' | 'failed';
+	type EpisodeScoreDetail = {
+		state: EpisodeScoreState;
+		trace: EpisodeScorePoint[];
+		error?: string | null;
+		updated_at?: number;
 	};
 	type SseEvent = {
 		type: 'episode_frames'|'frame'|'progress'|'done'|'error'|'ping';
@@ -112,6 +124,7 @@
 	type EpisodeSidebarCard = {
 		episode_id: number;
 		thumbnail: string | null;
+		thumbnailKind: 'image' | 'video';
 		incidents: number;
 		flagged: number;
 		scanning: boolean;
@@ -153,13 +166,20 @@
 	let currentEpisode = $state<number|null>(null);
 	let scanPhase = $state<'idle'|'loading'|'scoring'>('idle');
 	let playTimer: ReturnType<typeof setInterval>|null = null;
-	let episodeFrame = $state<number|null>(null);
-	let episodeScores = $state<Record<number, EpisodeScorePoint[]>>({});
-	let episodeScoresLoading = $state(false);
-	let episodeScoresReq = 0;
-	let episodeVideoUrls = $state<Record<number, string>>({});
-	let episodeCameraVideoUrls = $state<Record<number, Record<string, string>>>({});
-	let featuredCameraByEpisode = $state<Record<number, string>>({});
+		let episodeFrame = $state<number|null>(null);
+		let episodeScores = $state<Record<number, EpisodeScorePoint[]>>({});
+		let episodeScoresLoading = $state(false);
+		let episodeScoresLoadingByEpisode = $state<Record<number, boolean>>({});
+		let episodeScoresReadyByEpisode = $state<Record<number, boolean>>({});
+		let episodeScoreStateByEpisode = $state<Record<number, EpisodeScoreState>>({});
+		let episodeScoreErrorByEpisode = $state<Record<number, string | null>>({});
+		let episodeScoresRetryAfterByEpisode = $state<Record<number, number>>({});
+		let episodeScoresRetryNonce = $state<Record<number, number>>({});
+		let episodeScoresReq = 0;
+		let episodeVideoUrls = $state<Record<number, string>>({});
+		let episodeCameraVideoUrls = $state<Record<number, Record<string, string>>>({});
+		let episodeMediaLoadingByEpisode = $state<Record<number, boolean>>({});
+		let featuredCameraByEpisode = $state<Record<number, string>>({});
 	let cameraVideoEls = $state<Record<string, HTMLVideoElement>>({});
 	let episodeVideoReq = 0;
 	let episodeCameraVideoReq = 0;
@@ -186,6 +206,7 @@
 	let episodeClipRefs = $state<Record<number, EpisodeClipRef[]>>({});
 	let episodeClipReq = 0;
 	let catalogLoadReq = 0;
+	let catalogLoading = $state(true);
 	let inspectorOpen = $state(false);
 	let inspectorExpanded = $state(false);
 	let inspectorQuestion = $state('');
@@ -199,6 +220,33 @@
 
 	let es: EventSource|null = null;
 	let esReconnectTimer: ReturnType<typeof setTimeout> | null = null;
+	let episodeScoreRetryTimers = new Map<number, ReturnType<typeof setTimeout>>();
+
+	function clearEpisodeScoreRetryTimer(episodeId: number) {
+		const timer = episodeScoreRetryTimers.get(episodeId);
+		if (timer) clearTimeout(timer);
+		episodeScoreRetryTimers.delete(episodeId);
+	}
+
+	function scheduleEpisodeScoreRetry(episodeId: number, delayMs = 1500) {
+		clearEpisodeScoreRetryTimer(episodeId);
+		episodeScoresRetryAfterByEpisode = {
+			...episodeScoresRetryAfterByEpisode,
+			[episodeId]: Date.now() + delayMs
+		};
+		const timer = setTimeout(() => {
+			episodeScoreRetryTimers.delete(episodeId);
+			episodeScoresRetryAfterByEpisode = {
+				...episodeScoresRetryAfterByEpisode,
+				[episodeId]: 0
+			};
+			episodeScoresRetryNonce = {
+				...episodeScoresRetryNonce,
+				[episodeId]: Date.now()
+			};
+		}, delayMs);
+		episodeScoreRetryTimers.set(episodeId, timer);
+	}
 
 	onMount(() => {
 		void loadCatalog();
@@ -248,6 +296,8 @@
 			window.removeEventListener('droid:view-mode', onViewMode as EventListener);
 			es?.close();
 			if (esReconnectTimer) clearTimeout(esReconnectTimer);
+			for (const timer of episodeScoreRetryTimers.values()) clearTimeout(timer);
+			episodeScoreRetryTimers.clear();
 			stopVideoAnimationLoop();
 			if (inspectorTimer) clearTimeout(inspectorTimer);
 		};
@@ -346,74 +396,137 @@
 	});
 
 	$effect(() => {
-		const clip = activeClip;
+		activeClip;
+		episodeCurrentTime;
+		episodeDuration;
 		scanning;
-		if (!clip) return;
-		if (episodeScores[clip.episode_id]?.length) return;
-		const req = ++episodeScoresReq;
-		episodeScoresLoading = true;
-		void (async () => {
-			try {
-				const r = await fetch(`${API}/episode-scores/${clip.episode_id}`);
-				const rows: EpisodeScorePoint[] = r.ok ? await r.json() : [];
-				if (req === episodeScoresReq) {
-					episodeScores = {
-						...episodeScores,
-						[clip.episode_id]: rows.sort((a, b) => a.frame_index - b.frame_index)
-					};
-				}
-			} catch {
-				if (req === episodeScoresReq) {
-					episodeScores = { ...episodeScores, [clip.episode_id]: [] };
-				}
-			} finally {
-				if (req === episodeScoresReq) episodeScoresLoading = false;
-			}
-		})();
+		if (!activeClip || scanning) return;
+		updateEpisodeFrameState();
 	});
 
-	$effect(() => {
-		const clip = activeClip;
-		if (!clip) return;
-		if (episodeCameraVideoUrls[clip.episode_id]) return;
-		const req = ++episodeCameraVideoReq;
-		void (async () => {
-			try {
+		$effect(() => {
+			const clip = activeClip;
+			scanning;
+			episodeScoresRetryNonce[clip?.episode_id ?? -1];
+			if (!clip) return;
+			if (episodeScoresReadyByEpisode[clip.episode_id]) return;
+			if (episodeScoresLoadingByEpisode[clip.episode_id]) return;
+			if ((episodeScoresRetryAfterByEpisode[clip.episode_id] ?? 0) > Date.now()) return;
+			const req = ++episodeScoresReq;
+			episodeScoresLoading = true;
+			episodeScoresLoadingByEpisode = { ...episodeScoresLoadingByEpisode, [clip.episode_id]: true };
+			void (async () => {
+				try {
+					const r = await fetch(`${API}/episode-scores/${clip.episode_id}/detail`);
+					const detail: EpisodeScoreDetail = r.ok
+						? await r.json()
+						: { state: 'failed', trace: [], error: 'score detail request failed' };
+					const rows: EpisodeScorePoint[] = (detail.trace ?? []).sort((a, b) => a.frame_index - b.frame_index);
+					if (req === episodeScoresReq) {
+						episodeScores = {
+							...episodeScores,
+							[clip.episode_id]: rows
+						};
+						episodeScoreStateByEpisode = {
+							...episodeScoreStateByEpisode,
+							[clip.episode_id]: detail.state
+						};
+						episodeScoreErrorByEpisode = {
+							...episodeScoreErrorByEpisode,
+							[clip.episode_id]: detail.error ?? null
+						};
+						const hasTrace = rows.length > 0;
+						const terminal = detail.state === 'ready' || detail.state === 'failed';
+						episodeScoresReadyByEpisode = {
+							...episodeScoresReadyByEpisode,
+							[clip.episode_id]: terminal
+						};
+						if (terminal) {
+							clearEpisodeScoreRetryTimer(clip.episode_id);
+							episodeScoresRetryAfterByEpisode = {
+								...episodeScoresRetryAfterByEpisode,
+								[clip.episode_id]: 0
+							};
+						} else {
+							scheduleEpisodeScoreRetry(clip.episode_id);
+						}
+					}
+				} catch {
+					if (req === episodeScoresReq) {
+						episodeScores = { ...episodeScores, [clip.episode_id]: [] };
+						episodeScoreStateByEpisode = {
+							...episodeScoreStateByEpisode,
+							[clip.episode_id]: 'failed'
+						};
+						episodeScoreErrorByEpisode = {
+							...episodeScoreErrorByEpisode,
+							[clip.episode_id]: 'score detail request failed'
+						};
+						episodeScoresReadyByEpisode = {
+							...episodeScoresReadyByEpisode,
+							[clip.episode_id]: true
+						};
+						clearEpisodeScoreRetryTimer(clip.episode_id);
+					}
+				} finally {
+					if (req === episodeScoresReq) episodeScoresLoading = false;
+					episodeScoresLoadingByEpisode = { ...episodeScoresLoadingByEpisode, [clip.episode_id]: false };
+				}
+			})();
+		});
+
+		$effect(() => {
+			const clip = activeClip;
+			if (!clip) return;
+			if (episodeCameraVideoUrls[clip.episode_id]) return;
+			const req = ++episodeCameraVideoReq;
+			episodeMediaLoadingByEpisode = { ...episodeMediaLoadingByEpisode, [clip.episode_id]: true };
+			void (async () => {
+				try {
 				const r = await fetch(`${API}/episode-videos/${clip.episode_id}`);
 				if (!r.ok) return;
 				const payload = (await r.json()) as Record<string, string>;
 				if (req !== episodeCameraVideoReq) return;
-				const full: Record<string, string> = {};
-				for (const [camera, raw] of Object.entries(payload ?? {})) {
-					full[camera] = raw.startsWith('http') ? raw : `http://localhost:8000${raw}`;
+					const full: Record<string, string> = {};
+					for (const [camera, raw] of Object.entries(payload ?? {})) {
+						full[camera] = mediaUrl(raw, req);
+					}
+					if (Object.keys(full).length === 0) return;
+					episodeCameraVideoUrls = { ...episodeCameraVideoUrls, [clip.episode_id]: full };
+				} catch {
+					// ignore missing multi-camera videos
+				} finally {
+					if (req === episodeCameraVideoReq && episodeVideoUrls[clip.episode_id]) {
+						episodeMediaLoadingByEpisode = { ...episodeMediaLoadingByEpisode, [clip.episode_id]: false };
+					}
 				}
-				if (Object.keys(full).length === 0) return;
-				episodeCameraVideoUrls = { ...episodeCameraVideoUrls, [clip.episode_id]: full };
-			} catch {
-				// ignore missing multi-camera videos
-			}
-		})();
-	});
+			})();
+		});
 
-	$effect(() => {
-		const clip = activeClip;
-		if (!clip) return;
-		if (episodeVideoUrls[clip.episode_id]) return;
-		const req = ++episodeVideoReq;
-		void (async () => {
-			try {
+		$effect(() => {
+			const clip = activeClip;
+			if (!clip) return;
+			if (episodeVideoUrls[clip.episode_id]) return;
+			const req = ++episodeVideoReq;
+			episodeMediaLoadingByEpisode = { ...episodeMediaLoadingByEpisode, [clip.episode_id]: true };
+			void (async () => {
+				try {
 				const r = await fetch(`${API}/episode-video/${clip.episode_id}`);
 				if (!r.ok) return;
 				const payload = await r.json();
-				const raw = payload?.video_url as string | undefined;
-				if (!raw || req !== episodeVideoReq) return;
-				const full = raw.startsWith('http') ? raw : `http://localhost:8000${raw}`;
-				episodeVideoUrls = { ...episodeVideoUrls, [clip.episode_id]: full };
-			} catch {
-				// ignore missing server video
-			}
-		})();
-	});
+					const raw = payload?.video_url as string | undefined;
+					if (!raw || req !== episodeVideoReq) return;
+					const full = mediaUrl(raw, req);
+					episodeVideoUrls = { ...episodeVideoUrls, [clip.episode_id]: full };
+				} catch {
+					// ignore missing server video
+				} finally {
+					if (req === episodeVideoReq) {
+						episodeMediaLoadingByEpisode = { ...episodeMediaLoadingByEpisode, [clip.episode_id]: false };
+					}
+				}
+			})();
+		});
 
 	$effect(() => {
 		const clip = activeClip;
@@ -471,46 +584,54 @@
 	// ── Load existing catalog into clips ──────────────────────────────────────
 	async function loadCatalog() {
 		const req = ++catalogLoadReq;
-		const [episodesRes, momRes, descRes] = await Promise.all([
-			fetch(`${API}/episodes`), fetch(`${API}/catalog`), fetch(`${API}/descriptions`)
-		]);
-		if (req !== catalogLoadReq) return;
-		const episodes: EpisodeSummary[] = episodesRes.ok ? await episodesRes.json() : [];
-		const moments: Moment[] = await momRes.json();
-		const allDescs: Record<string, Record<string,string>> = await descRes.json();
+		catalogLoading = true;
+		try {
+			const [episodesRes, momRes, descRes] = await Promise.all([
+				fetch(`${API}/episodes`), fetch(`${API}/catalog`), fetch(`${API}/descriptions`)
+			]);
+			if (req !== catalogLoadReq) return;
+			const episodes: EpisodeSummary[] = episodesRes.ok ? await episodesRes.json() : [];
+			const moments: Moment[] = await momRes.json();
+			const allDescs: Record<string, Record<string,string>> = await descRes.json();
 
-		const map = new Map<number, Clip>();
-		for (const ep of episodes) {
-			map.set(ep.episode_id, {
-				episode_id: ep.episode_id,
-				preview_urls: [],
-				flagged: [],
-				moments: [],
-				descriptions: allDescs[String(ep.episode_id)] ?? {},
-			});
-		}
-		for (const m of moments) {
-			if (!map.has(m.episode_id)) {
-				map.set(m.episode_id, {
-					episode_id: m.episode_id,
+			const map = new Map<number, Clip>();
+			for (const ep of episodes) {
+				map.set(ep.episode_id, {
+					episode_id: ep.episode_id,
 					preview_urls: [],
 					flagged: [],
 					moments: [],
-					descriptions: allDescs[String(m.episode_id)] ?? {},
+					descriptions: allDescs[String(ep.episode_id)] ?? {},
 				});
 			}
-			const clip = map.get(m.episode_id)!;
-			clip.moments.push(m);
-			if (!clip.flagged.find(f => f.frame_index === m.frame_index)) {
-				clip.flagged.push({
-					frame_index: m.frame_index,
-					cluster_id: m.cluster_id,
-					frame_url: FURL(m.episode_id, m.frame_index),
-				});
+			for (const m of moments) {
+				if (!map.has(m.episode_id)) {
+					map.set(m.episode_id, {
+						episode_id: m.episode_id,
+						preview_urls: [],
+						flagged: [],
+						moments: [],
+						descriptions: allDescs[String(m.episode_id)] ?? {},
+					});
+				}
+				const clip = map.get(m.episode_id)!;
+				clip.moments.push(m);
+				if (!clip.flagged.find(f => f.frame_index === m.frame_index)) {
+					clip.flagged.push({
+						frame_index: m.frame_index,
+						cluster_id: m.cluster_id,
+						frame_url: FURL(m.episode_id, m.frame_index),
+					});
+				}
 			}
+			if (req !== catalogLoadReq) return;
+			clips = map;
+			for (const episodeId of map.keys()) {
+				void hydrateEpisodeMedia(episodeId);
+			}
+		} finally {
+			if (req === catalogLoadReq) catalogLoading = false;
 		}
-		if (req !== catalogLoadReq) return;
-		clips = map;
 	}
 
 	function closeEventStream() {
@@ -569,7 +690,7 @@
 					if (raw) {
 						episodeVideoUrls = {
 							...episodeVideoUrls,
-							[episodeId]: raw.startsWith('http') ? raw : `http://localhost:8000${raw}`
+							[episodeId]: mediaUrl(raw, episodeId)
 						};
 					}
 				}
@@ -584,7 +705,7 @@
 				const payload = (await r.json()) as Record<string, string>;
 				const mapped: Record<string, string> = {};
 				for (const [camera, raw] of Object.entries(payload ?? {})) {
-					mapped[camera] = raw.startsWith('http') ? raw : `http://localhost:8000${raw}`;
+					mapped[camera] = mediaUrl(raw, episodeId);
 				}
 				if (Object.keys(mapped).length > 0) {
 					episodeCameraVideoUrls = { ...episodeCameraVideoUrls, [episodeId]: mapped };
@@ -643,24 +764,24 @@
 			scanStatus = `ep ${e.episode_id}  ·  ${e.total_frames} frames  ·  scoring…`;
 			currentEpisode = e.episode_id ?? null;
 			scanPhase = 'scoring';
-			if (!clips.has(e.episode_id!)) {
-				clips.set(e.episode_id!, {
-					episode_id: e.episode_id!, preview_urls: urls,
-					flagged: [], moments: [], descriptions: {},
-					video_url: e.video_url ? `http://localhost:8000${e.video_url}` : undefined,
-				});
+				if (!clips.has(e.episode_id!)) {
+					clips.set(e.episode_id!, {
+						episode_id: e.episode_id!, preview_urls: urls,
+						flagged: [], moments: [], descriptions: {},
+						video_url: e.video_url ? mediaUrl(e.video_url, e.episode_id ?? Date.now()) : undefined,
+					});
 				clips = new Map(clips);
 			}
 			if (e.video_url && e.episode_id !== undefined) {
-				episodeVideoUrls = {
-					...episodeVideoUrls,
-					[e.episode_id]: `http://localhost:8000${e.video_url}`
-				};
-			}
+					episodeVideoUrls = {
+						...episodeVideoUrls,
+						[e.episode_id]: mediaUrl(e.video_url, e.episode_id)
+					};
+				}
 			if (e.camera_videos && e.episode_id !== undefined) {
 				const mapped: Record<string, string> = {};
 				for (const [camera, raw] of Object.entries(e.camera_videos)) {
-					mapped[camera] = raw.startsWith('http') ? raw : `http://localhost:8000${raw}`;
+					mapped[camera] = mediaUrl(raw, e.episode_id ?? Date.now());
 				}
 				episodeCameraVideoUrls = {
 					...episodeCameraVideoUrls,
@@ -693,17 +814,17 @@
 		}
 	}
 
-	async function startScan() {
-		clips = new Map(); frameBuf = []; displayFrame = ''; scanFrameGroups = []; scanFrameDisplay = {}; exportMsg = null;
-		episodeScores = {};
-		episodeVideoUrls = {};
-		episodeCameraVideoUrls = {};
-		featuredCameraByEpisode = {};
-		cameraVideoEls = {};
-		const r = await fetch(`${API}/scan`, { method:'POST', headers:{'Content-Type':'application/json'}, body:'{}' });
-		if (!r.ok) { scanStatus = (await r.json()).detail ?? 'scan failed'; return; }
-		jobRunning = 'scan'; scanning = true; scanPaused = false; scanStatus = 'initialising…';
-		scanPhase = 'loading'; currentEpisode = null;
+		async function startScan() {
+			frameBuf = [];
+			displayFrame = '';
+			scanFrameGroups = [];
+			scanFrameDisplay = {};
+			exportMsg = null;
+			cameraVideoEls = {};
+			const r = await fetch(`${API}/scan`, { method:'POST', headers:{'Content-Type':'application/json'}, body:'{}' });
+			if (!r.ok) { scanStatus = (await r.json()).detail ?? 'scan failed'; return; }
+			jobRunning = 'scan'; scanning = true; scanPaused = false; scanStatus = 'initialising…';
+			scanPhase = 'loading'; currentEpisode = null;
 		startPlayback();
 
 		openEs(`${API}/scan/events`, handleScanEvent, 'scan');
@@ -813,7 +934,17 @@
 	function episodeRepresentativeUrl(clip: Clip): string | null {
 		if (clip.flagged.length > 0) return clip.flagged[0].frame_url;
 		if (clip.moments.length > 0) return FURL(clip.moments[0].episode_id, clip.moments[0].frame_index);
+		if (clip.video_url) return clip.video_url;
+		const primaryVideo = episodeVideoUrls[clip.episode_id];
+		if (primaryVideo) return primaryVideo;
+		const cameraVideo = Object.values(episodeCameraVideoUrls[clip.episode_id] ?? {})[0];
+		if (cameraVideo) return cameraVideo;
 		return clip.preview_urls[0] ?? null;
+	}
+
+	function episodeRepresentativeKind(clip: Clip): 'image' | 'video' {
+		const url = episodeRepresentativeUrl(clip);
+		return url && url.toLowerCase().includes('.mp4') ? 'video' : 'image';
 	}
 
 	function incidentGroups(clip: Clip): IncidentGroup[] {
@@ -832,6 +963,12 @@
 	}
 
 	function episodeBounds(clip: Clip) {
+		const trace = scoreSeries(clip);
+		if (trace.length > 0) {
+			const min = trace[0].frame_index;
+			const max = trace[trace.length - 1].frame_index;
+			return { min, max, span: Math.max(1, max - min) };
+		}
 		let min = Number.POSITIVE_INFINITY;
 		let max = 0;
 		for (const m of clip.moments) {
@@ -890,7 +1027,9 @@
 	function interpolatedScorePoint(clip: Clip): EpisodeScorePoint | null {
 		const series = smoothedScoreSeries(clip);
 		if (series.length === 0) return null;
-		const frame = currentEpisodeFrame(clip);
+		const pct = currentPlaybackPercent();
+		const targetIndex = Math.max(0, Math.min(series.length - 1, Math.round(pct * (series.length - 1))));
+		const frame = series[targetIndex]?.frame_index ?? series[0].frame_index;
 		if (frame <= series[0].frame_index) return { ...series[0] };
 		if (frame >= series[series.length - 1].frame_index) return { ...series[series.length - 1] };
 		for (let i = 1; i < series.length; i += 1) {
@@ -912,7 +1051,9 @@
 	function playedSmoothedSeries(clip: Clip): EpisodeScorePoint[] {
 		const series = smoothedScoreSeries(clip);
 		if (series.length === 0) return [];
-		const frame = currentEpisodeFrame(clip);
+		const pct = currentPlaybackPercent();
+		const frame = series[Math.max(0, Math.min(series.length - 1, Math.round(pct * (series.length - 1))))]?.frame_index
+			?? currentEpisodeFrame(clip);
 		const played = series.filter((p) => p.frame_index <= frame);
 		const head = interpolatedScorePoint(clip);
 		if (head && (played.length === 0 || played[played.length - 1].frame_index !== head.frame_index)) {
@@ -926,6 +1067,19 @@
 	}
 
 	function flaggedSegments(clip: Clip): FlagSegment[] {
+		const incidentSegments = clip.moments
+			.map((m) => {
+				if (Array.isArray(m.incident_span) && m.incident_span.length === 2) {
+					return {
+						start: Math.min(m.incident_span[0], m.incident_span[1]),
+						end: Math.max(m.incident_span[0], m.incident_span[1])
+					};
+				}
+				return null;
+			})
+			.filter((seg): seg is FlagSegment => seg !== null)
+			.sort((a, b) => a.start - b.start);
+		if (incidentSegments.length > 0) return incidentSegments;
 		const flagged = scoreSeries(clip)
 			.filter((p) => p.flagged)
 			.sort((a, b) => a.frame_index - b.frame_index);
@@ -957,10 +1111,16 @@
 		}) as FlaggedAreaPoint[];
 	}
 
+	function currentPlaybackPercent(): number {
+		if (episodeDuration > 0) {
+			return Math.max(0, Math.min(1, currentPlaybackTime() / episodeDuration));
+		}
+		return 0;
+	}
+
 	function playheadPercent(clip: Clip): number {
-		const { min, span } = episodeBounds(clip);
-		const frame = currentEpisodeFrame(clip);
-		return Math.max(0, Math.min(100, ((frame - min) / Math.max(1, span)) * 100));
+		void clip;
+		return currentPlaybackPercent() * 100;
 	}
 
 	function seekToPercent(clip: Clip, pct: number) {
@@ -970,6 +1130,7 @@
 			const next = p * episodeDuration;
 			lead.currentTime = next;
 			episodeCurrentTime = next;
+			updateEpisodeFrameState();
 			return;
 		}
 		const { min, span } = episodeBounds(clip);
@@ -1002,83 +1163,148 @@
 	function stopVideoAnimationLoop() {
 		videoAnimating = false;
 		if (videoRaf !== null) {
-			cancelAnimationFrame(videoRaf);
+			clearTimeout(videoRaf);
 			videoRaf = null;
 		}
 	}
 
+	function featuredVideoElement(): HTMLVideoElement | null {
+		const clip = activeClip;
+		if (!clip) return episodeVideoEl;
+		const camera = featuredCamera(clip);
+		if (camera && cameraVideoEls[camera]?.isConnected) return cameraVideoEls[camera];
+		return episodeVideoEl;
+	}
+
 	function startVideoAnimationLoop() {
-		if (videoAnimating || !episodeVideoEl) return;
+		const target = featuredVideoElement() ?? resolveEpisodeVideoTarget();
+		if (videoAnimating || !target) return;
+		episodeVideoEl = target;
 		videoAnimating = true;
+		const updateFromActive = () => {
+			const active = featuredVideoElement() ?? resolveEpisodeVideoTarget();
+			if (!videoAnimating || !active) return null;
+			episodeVideoEl = active;
+			episodeCurrentTime = active.currentTime;
+			episodeDuration = Number.isFinite(active.duration) ? active.duration : episodeDuration;
+			updateEpisodeFrameState();
+			return active;
+		};
 		const tick = () => {
-			if (!videoAnimating || !episodeVideoEl) return;
-			if (!episodeVideoEl.paused) {
-				episodeCurrentTime = episodeVideoEl.currentTime;
-				videoRaf = requestAnimationFrame(tick);
+			const active = updateFromActive();
+			if (!active) return;
+			if (!active.paused) {
+				videoRaf = window.setTimeout(tick, 33) as unknown as number;
 				return;
 			}
 			stopVideoAnimationLoop();
 		};
-		videoRaf = requestAnimationFrame(tick);
+		videoRaf = window.setTimeout(tick, 33) as unknown as number;
 	}
 
-	function syncVideoUiState() {
-		if (!episodeVideoEl) return;
-		videoPlaying = !episodeVideoEl.paused;
-		videoMuted = episodeVideoEl.muted;
-		videoLoop = episodeVideoEl.loop;
-		videoRate = episodeVideoEl.playbackRate;
-	}
+		function syncVideoUiState() {
+			if (!episodeVideoEl) return;
+			videoPlaying = !episodeVideoEl.paused;
+			videoMuted = episodeVideoEl.muted;
+			videoLoop = episodeVideoEl.loop;
+			videoRate = episodeVideoEl.playbackRate;
+		}
 
-	function resolveEpisodeVideoTarget(): HTMLVideoElement | null {
-		if (episodeVideoEl) return episodeVideoEl;
-		const clip = activeClip;
-		if (clip) {
-			const camera = featuredCamera(clip);
-			if (camera && cameraVideoEls[camera]) {
-				episodeVideoEl = cameraVideoEls[camera];
-				syncVideoUiState();
+		function connectedCameraVideoEls(): Record<string, HTMLVideoElement> {
+			return Object.fromEntries(
+				Object.entries(cameraVideoEls).filter(([, el]) => el && el.isConnected)
+			);
+		}
+
+		function allEpisodeVideoEls(): HTMLVideoElement[] {
+			const connected = Object.values(connectedCameraVideoEls());
+			if (connected.length > 0) return connected;
+			if (typeof document === 'undefined') return [];
+			return Array.from(document.querySelectorAll('.episode-camera-wrap .episode-video-frame'));
+		}
+
+		function peekEpisodeVideoTarget(): HTMLVideoElement | null {
+			const connected = connectedCameraVideoEls();
+			if (episodeVideoEl && episodeVideoEl.isConnected && Object.values(connected).includes(episodeVideoEl)) {
 				return episodeVideoEl;
 			}
+			const clip = activeClip;
+			if (clip) {
+				const camera = featuredCamera(clip);
+				if (camera && connected[camera]) return connected[camera];
+			}
+			return Object.values(connected)[0] ?? allEpisodeVideoEls()[0] ?? null;
 		}
-		const fallback = Object.values(cameraVideoEls)[0] ?? null;
-		if (fallback) {
-			episodeVideoEl = fallback;
+
+		function resolveEpisodeVideoTarget(): HTMLVideoElement | null {
+			const fallback = peekEpisodeVideoTarget();
+			if (fallback) {
+				episodeVideoEl = fallback;
+				episodeDuration = Number.isFinite(fallback.duration) ? fallback.duration : episodeDuration;
+				episodeCurrentTime = fallback.currentTime || episodeCurrentTime;
+				syncVideoUiState();
+			}
+			return fallback;
+		}
+
+		function currentPlaybackTime(): number {
+			// episodeCurrentTime is $state, updated by the animation loop every 33ms.
+			// Reading it here makes playheadPercent a reactive dependency so Svelte
+			// re-renders the timeline bar as the video plays.
+			return episodeCurrentTime;
+		}
+
+		function syncFollowerVideos(lead: HTMLVideoElement) {
+			for (const el of allEpisodeVideoEls()) {
+				if (el === lead) continue;
+				el.muted = lead.muted;
+				el.loop = lead.loop;
+				el.playbackRate = lead.playbackRate;
+				const duration = Number.isFinite(el.duration) ? el.duration : lead.duration;
+				const targetTime = Math.max(0, Math.min(duration || 0, lead.currentTime));
+				if (Math.abs(el.currentTime - targetTime) > 0.08) {
+					el.currentTime = targetTime;
+				}
+			}
+		}
+
+		async function toggleVideoPlay() {
+			const lead = resolveEpisodeVideoTarget();
+			if (!lead) return;
+			const els = allEpisodeVideoEls();
+			if (lead.paused) {
+				try {
+					await lead.play();
+				} catch {
+					return;
+				}
+				episodeVideoEl = lead;
+				episodeCurrentTime = lead.currentTime;
+				episodeDuration = Number.isFinite(lead.duration) ? lead.duration : episodeDuration;
+				updateEpisodeFrameState();
+				startVideoAnimationLoop();
+				syncFollowerVideos(lead);
+				for (const el of els) {
+					if (el === lead) continue;
+					void el.play().catch(() => undefined);
+				}
+			} else {
+				for (const el of els) el.pause();
+			}
 			syncVideoUiState();
 		}
-		return fallback;
-	}
 
-	async function toggleVideoPlay() {
-		const els = Object.values(cameraVideoEls);
-		const lead = resolveEpisodeVideoTarget();
-		if (els.length === 0 && !lead) return;
-		if (!lead) return;
-		if (lead.paused) {
-			await Promise.all(els.map(async (el) => {
-				try {
-					await el.play();
-				} catch {
-					// ignore autoplay/playback interruptions
-				}
-			}));
-		} else {
-			for (const el of els) el.pause();
-		}
-		syncVideoUiState();
-	}
-
-	function seekVideo(deltaSec: number) {
-		const els = Object.values(cameraVideoEls);
-		const lead = resolveEpisodeVideoTarget();
-		if (els.length === 0 && !lead) return;
-		if (!lead) return;
-		const next = Math.max(0, Math.min(lead.duration || 0, lead.currentTime + deltaSec));
-		for (const el of els) {
-			const duration = Number.isFinite(el.duration) ? el.duration : lead.duration;
-			el.currentTime = Math.max(0, Math.min(duration || 0, next));
-		}
+		function seekVideo(deltaSec: number) {
+			const lead = resolveEpisodeVideoTarget();
+			if (!lead) return;
+			const els = allEpisodeVideoEls();
+			const next = Math.max(0, Math.min(lead.duration || 0, lead.currentTime + deltaSec));
+			for (const el of els) {
+				const duration = Number.isFinite(el.duration) ? el.duration : lead.duration;
+				el.currentTime = Math.max(0, Math.min(duration || 0, next));
+			}
 		episodeCurrentTime = next;
+		updateEpisodeFrameState();
 	}
 
 	function adaptiveSeekStepSec(): number {
@@ -1087,44 +1313,53 @@
 		return Math.max(1, Math.min(10, duration * 0.1));
 	}
 
-	function toggleVideoLoop() {
-		const els = Object.values(cameraVideoEls);
-		const lead = resolveEpisodeVideoTarget();
-		if (els.length === 0 && !lead) return;
-		if (!lead) return;
-		const next = !lead.loop;
-		for (const el of els) el.loop = next;
+		function toggleVideoLoop() {
+			const lead = resolveEpisodeVideoTarget();
+			if (!lead) return;
+			const els = allEpisodeVideoEls();
+			const next = !lead.loop;
+			for (const el of els) el.loop = next;
+			syncVideoUiState();
+		}
+
+		function toggleVideoMute() {
+			const lead = resolveEpisodeVideoTarget();
+			if (!lead) return;
+			const els = allEpisodeVideoEls();
+			const next = !lead.muted;
+			for (const el of els) el.muted = next;
+			syncVideoUiState();
+		}
+
+		function cycleVideoRate() {
+			const lead = resolveEpisodeVideoTarget();
+			if (!lead) return;
+			const els = allEpisodeVideoEls();
+			const rates = [0.5, 1, 1.25, 1.5, 2];
+			const idx = rates.indexOf(lead.playbackRate);
+			const next = rates[(idx + 1) % rates.length];
+			for (const el of els) el.playbackRate = next;
 		syncVideoUiState();
 	}
 
-	function toggleVideoMute() {
-		const els = Object.values(cameraVideoEls);
-		const lead = resolveEpisodeVideoTarget();
-		if (els.length === 0 && !lead) return;
-		if (!lead) return;
-		const next = !lead.muted;
-		for (const el of els) el.muted = next;
-		syncVideoUiState();
-	}
+		function episodeCameraEntries(clip: Clip): Array<[string, string]> {
+			const fromCameraMap = Object.entries(episodeCameraVideoUrls[clip.episode_id] ?? {});
+			if (fromCameraMap.length > 0) return fromCameraMap;
+			const primary = episodeVideoUrls[clip.episode_id];
+			return primary ? [['primary', primary]] : [];
+		}
 
-	function cycleVideoRate() {
-		const els = Object.values(cameraVideoEls);
-		const lead = resolveEpisodeVideoTarget();
-		if (els.length === 0 && !lead) return;
-		if (!lead) return;
-		const rates = [0.5, 1, 1.25, 1.5, 2];
-		const idx = rates.indexOf(lead.playbackRate);
-		const next = rates[(idx + 1) % rates.length];
-		for (const el of els) el.playbackRate = next;
-		syncVideoUiState();
-	}
+		function episodeMediaLoading(clip: Clip): boolean {
+			return Boolean(episodeMediaLoadingByEpisode[clip.episode_id]);
+		}
 
-	function episodeCameraEntries(clip: Clip): Array<[string, string]> {
-		const fromCameraMap = Object.entries(episodeCameraVideoUrls[clip.episode_id] ?? {});
-		if (fromCameraMap.length > 0) return fromCameraMap;
-		const primary = episodeVideoUrls[clip.episode_id];
-		return primary ? [['primary', primary]] : [];
-	}
+		function episodeScoreLoading(clip: Clip): boolean {
+			return Boolean(episodeScoresLoadingByEpisode[clip.episode_id]);
+		}
+
+		function episodeScoreState(clip: Clip): EpisodeScoreState {
+			return episodeScoreStateByEpisode[clip.episode_id] ?? 'pending';
+		}
 
 	function scanOverlayCameraEntries(): Array<[string, string]> {
 		if (currentEpisode === null) return [];
@@ -1134,7 +1369,7 @@
 		return byCamera.filter(([, url]) => !primaryUrl || url !== primaryUrl);
 	}
 
-	function featuredCamera(clip: Clip): string | null {
+		function featuredCamera(clip: Clip): string | null {
 		const selected = featuredCameraByEpisode[clip.episode_id];
 		if (!selected) {
 			const first = episodeCameraEntries(clip)[0]?.[0];
@@ -1142,18 +1377,79 @@
 		}
 		if (episodeCameraEntries(clip).some(([camera]) => camera === selected)) return selected;
 		return episodeCameraEntries(clip)[0]?.[0] ?? null;
-	}
+		}
 
-	function selectFeaturedCamera(clip: Clip, camera: string) {
+		function isFeaturedReviewCamera(camera: string): boolean {
+			const clip = activeClip;
+			if (!clip) return false;
+			return featuredCamera(clip) === camera;
+		}
+
+		function selectFeaturedCamera(clip: Clip, camera: string) {
+		const previous = resolveEpisodeVideoTarget();
+		const wasPlaying = previous ? !previous.paused : false;
+		const priorTime = previous?.currentTime ?? episodeCurrentTime;
+		const priorMuted = previous?.muted ?? videoMuted;
+		const priorLoop = previous?.loop ?? videoLoop;
+		const priorRate = previous?.playbackRate ?? videoRate;
 		featuredCameraByEpisode = { ...featuredCameraByEpisode, [clip.episode_id]: camera };
-		const el = cameraVideoEls[camera];
-		if (el) {
+		requestAnimationFrame(() => {
+			const el = cameraVideoEls[camera];
+			if (!el) return;
+			el.muted = priorMuted;
+			el.loop = priorLoop;
+			el.playbackRate = priorRate;
+			const duration = Number.isFinite(el.duration) ? el.duration : episodeDuration;
+			el.currentTime = Math.max(0, Math.min(duration || priorTime, priorTime));
 			episodeVideoEl = el;
-			episodeDuration = el.duration || episodeDuration;
+			episodeDuration = duration || episodeDuration;
+			episodeCurrentTime = el.currentTime;
+			updateEpisodeFrameState();
+			if (wasPlaying) {
+				for (const other of allEpisodeVideoEls()) {
+					if (other !== el) other.pause();
+				}
+				void el.play().catch(() => undefined);
+				startVideoAnimationLoop();
+			} else {
+				syncVideoUiState();
+			}
+		});
+		}
+
+		function bindActiveReviewVideo(camera: string) {
+			const el = cameraVideoEls[camera];
+			if (!el) return;
+			episodeVideoEl = el;
+			episodeDuration = Number.isFinite(el.duration) ? el.duration : episodeDuration;
 			episodeCurrentTime = el.currentTime || episodeCurrentTime;
 			syncVideoUiState();
 		}
-	}
+
+		function onReviewVideoLoaded(camera: string) {
+			if (!isFeaturedReviewCamera(camera)) return;
+			bindActiveReviewVideo(camera);
+		}
+
+		function onReviewVideoTimeUpdate(camera: string) {
+			if (!isFeaturedReviewCamera(camera)) return;
+			const el = cameraVideoEls[camera];
+			if (!el) return;
+			if (episodeVideoEl !== el) episodeVideoEl = el;
+			episodeDuration = Number.isFinite(el.duration) ? el.duration : episodeDuration;
+			episodeCurrentTime = el.currentTime;
+			updateEpisodeFrameState();
+			syncVideoUiState();
+		}
+
+		function reviewLoadingText(clip: Clip): string | null {
+			const scoreState = episodeScoreState(clip);
+			if (episodeMediaLoading(clip) && (episodeScoreLoading(clip) || scoreState === 'pending' || scoreState === 'scoring')) return 'loading episode media and score trace…';
+			if (episodeMediaLoading(clip)) return 'loading episode media…';
+			if (scoreState === 'pending') return 'score trace queued…';
+			if (scoreState === 'scoring' || episodeScoreLoading(clip)) return 'scoring trace…';
+			return null;
+		}
 
 	function registerCameraVideo(node: HTMLVideoElement, camera: string) {
 		cameraVideoEls = { ...cameraVideoEls, [camera]: node };
@@ -1193,14 +1489,38 @@
 		return entries.filter(([, url]) => !primary || url !== primary);
 	}
 
-	function currentEpisodeFrame(clip: Clip): number {
-		const videoUrl = episodeVideoUrls[clip.episode_id] || episodeCameraEntries(clip).length > 0;
-		if (videoUrl && episodeDuration > 0) {
-			const { min, span } = episodeBounds(clip);
-			return Math.round(min + (episodeCurrentTime / episodeDuration) * span);
+		function computeEpisodeFrame(clip: Clip): number {
+			const playbackTime = currentPlaybackTime();
+			const trace = scoreSeries(clip);
+			if (trace.length > 0 && episodeDuration > 0) {
+				const pct = Math.max(0, Math.min(1, playbackTime / episodeDuration));
+				const played = Math.max(0, Math.min(trace.length - 1, Math.round(pct * (trace.length - 1))));
+				return trace[played]?.frame_index ?? trace[0].frame_index;
+			}
+			const videoUrl = episodeVideoUrls[clip.episode_id] || episodeCameraEntries(clip).length > 0;
+			if (videoUrl && episodeDuration > 0) {
+				const { min, span } = episodeBounds(clip);
+				return Math.round(min + (playbackTime / episodeDuration) * span);
+			}
+			if (trace.length > 0) {
+				const played = Math.max(0, Math.min(trace.length - 1, Math.round((playbackTime || 0) * 8)));
+				return trace[played]?.frame_index ?? trace[0].frame_index;
+			}
+			return episodeFrame ?? selMoment?.frame_index ?? clip.moments[0]?.frame_index ?? 0;
 		}
-		return episodeFrame ?? selMoment?.frame_index ?? clip.moments[0]?.frame_index ?? 0;
-	}
+
+		function updateEpisodeFrameState() {
+			const clip = activeClip;
+			if (!clip || scanning) return;
+			episodeFrame = computeEpisodeFrame(clip);
+		}
+
+		function currentEpisodeFrame(clip: Clip): number {
+			if (activeClip && clip.episode_id === activeClip.episode_id && episodeFrame !== null) {
+				return episodeFrame;
+			}
+			return computeEpisodeFrame(clip);
+		}
 
 	function currentEpisodeClipRef(clip: Clip): EpisodeClipRef | null {
 		const refs = episodeClipRefs[clip.episode_id] ?? [];
@@ -1269,13 +1589,14 @@
 	let episodeSidebarCards = $derived(
 		[...clips.values()]
 			.reverse()
-			.map(
-				(clip): EpisodeSidebarCard => ({
-					episode_id: clip.episode_id,
-					thumbnail: episodeRepresentativeUrl(clip),
-					incidents: incidentGroups(clip).length,
-					flagged: clip.moments.length,
-					scanning: isScanActive() && currentEpisode === clip.episode_id
+				.map(
+					(clip): EpisodeSidebarCard => ({
+						episode_id: clip.episode_id,
+						thumbnail: episodeRepresentativeUrl(clip),
+						thumbnailKind: episodeRepresentativeKind(clip),
+						incidents: incidentGroups(clip).length,
+						flagged: clip.moments.length,
+						scanning: isScanActive() && currentEpisode === clip.episode_id
 				})
 			)
 	);
@@ -1405,21 +1726,6 @@
 										<path d="M20 17v-4"></path>
 									</svg>
 								</button>
-								<button class="video-btn icon-only" aria-label={videoMuted ? 'Unmute' : 'Mute'} title={videoMuted ? 'unmute' : 'mute'} onclick={toggleVideoMute}>
-									{#if videoMuted}
-										<svg class="video-icon" viewBox="0 0 24 24" aria-hidden="true">
-											<polygon points="4,10 8,10 13,6 13,18 8,14 4,14"></polygon>
-											<line x1="17" y1="9" x2="21" y2="15"></line>
-											<line x1="21" y1="9" x2="17" y2="15"></line>
-										</svg>
-									{:else}
-										<svg class="video-icon" viewBox="0 0 24 24" aria-hidden="true">
-											<polygon points="4,10 8,10 13,6 13,18 8,14 4,14"></polygon>
-											<path d="M16 10c1.5 1.5 1.5 2.5 0 4"></path>
-											<path d="M18.6 8c3.2 3.2 3.2 6.8 0 10"></path>
-										</svg>
-									{/if}
-								</button>
 								<button class="video-btn" onclick={cycleVideoRate}>{videoRate.toFixed(2)}x</button>
 							</div>
 						{/if}
@@ -1431,45 +1737,48 @@
 									{#each episodeCameraEntries(activeClip) as [camera, url] (camera)}
 										<div class="episode-camera-slot" class:camera-hidden={featuredCamera(activeClip) !== camera}>
 											<!-- svelte-ignore a11y_media_has_caption -->
-											<video
-												use:registerCameraVideo={camera}
-												src={url}
-												class="episode-video-frame"
-												preload="metadata"
-												playsinline
-												onplay={() => { if (episodeVideoEl === cameraVideoEls[camera]) startVideoAnimationLoop(); syncVideoUiState(); }}
-												onpause={() => { if (episodeVideoEl === cameraVideoEls[camera]) stopVideoAnimationLoop(); syncVideoUiState(); }}
+													<video
+														use:registerCameraVideo={camera}
+														data-camera={camera}
+														src={url}
+														class="episode-video-frame"
+													preload="metadata"
+													playsinline
+													onplay={() => { if (episodeVideoEl === cameraVideoEls[camera]) startVideoAnimationLoop(); syncVideoUiState(); }}
+													onpause={() => { if (episodeVideoEl === cameraVideoEls[camera]) stopVideoAnimationLoop(); syncVideoUiState(); }}
 												onseeking={() => {
 													if (episodeVideoEl !== cameraVideoEls[camera]) return;
 													if (!episodeVideoEl) return;
 													episodeCurrentTime = episodeVideoEl.currentTime;
 												}}
 												onvolumechange={syncVideoUiState}
-												onratechange={syncVideoUiState}
-												ontimeupdate={() => {
-													if (episodeVideoEl !== cameraVideoEls[camera]) return;
-													if (!episodeVideoEl) return;
-													episodeCurrentTime = episodeVideoEl.currentTime;
-												}}
-												onloadedmetadata={() => {
-													const el = cameraVideoEls[camera];
-													if (!el) return;
-													if (episodeVideoEl === el) {
-														episodeDuration = el.duration || 0;
-														episodeCurrentTime = el.currentTime || 0;
-														syncVideoUiState();
-													}
-												}}
-											></video>
-										</div>
-									{/each}
-								{:else}
+													onratechange={syncVideoUiState}
+													ontimeupdate={() => {
+														onReviewVideoTimeUpdate(camera);
+													}}
+													onloadedmetadata={() => {
+														onReviewVideoLoaded(camera);
+													}}
+													onloadeddata={() => {
+														onReviewVideoLoaded(camera);
+													}}
+												></video>
+											</div>
+										{/each}
+									{:else}
 									<div class="episode-camera-slot">
 										<img src={FURL(activeClip.episode_id, currentEpisodeFrame(activeClip))} alt="" class="episode-video-frame" />
 									</div>
 								{/if}
+								<!-- Frame number overlay — top-left, updates with playhead -->
+								<div class="frame-number-overlay">
+									frame {currentEpisodeFrame(activeClip)}
+								</div>
 								<div class="score-overlay">
-									{#if smoothedScoreSeries(activeClip).length > 0}
+										{#if reviewLoadingText(activeClip)}
+											<p class="score-plot-empty score-loading">{reviewLoadingText(activeClip)}</p>
+										{/if}
+										{#if smoothedScoreSeries(activeClip).length > 0}
 										<Plot
 											height={72}
 											axes={false}
@@ -1515,14 +1824,13 @@
 											<div class="score-timeline-played" style={`width:${playheadPercent(activeClip)}%`}></div>
 											<div class="score-timeline-head" style={`left:${playheadPercent(activeClip)}%`}></div>
 										</div>
-									{:else if episodeScoresLoading}
-										<p class="score-plot-empty">loading score trace…</p>
+										{:else if episodeScoreState(activeClip) === 'failed'}
+											<p class="score-plot-empty">score trace unavailable</p>
+										{:else if episodeScoreLoading(activeClip) || episodeScoreState(activeClip) === 'pending' || episodeScoreState(activeClip) === 'scoring'}
+											<p class="score-plot-empty">{reviewLoadingText(activeClip) ?? 'loading score trace…'}</p>
 									{:else}
 										<p class="score-plot-empty">no score trace yet</p>
 									{/if}
-									<div class="episode-video-meta">
-										<span>frame {currentEpisodeFrame(activeClip)}</span>
-									</div>
 								</div>
 							</div>
 
@@ -1620,10 +1928,11 @@
 		</div>
 
 		<!-- ── Clips panel ── -->
-		<EpisodesSidebar
-			cards={episodeSidebarCards}
-			{activeEp}
-			onSelectEpisode={(episodeId) => {
+			<EpisodesSidebar
+				cards={episodeSidebarCards}
+				{activeEp}
+				loading={catalogLoading}
+				onSelectEpisode={(episodeId) => {
 				activeEp = episodeId;
 				selMoment = null;
 			}}
@@ -1805,8 +2114,8 @@
 		display:flex;
 		flex-direction:column;
 		border-radius:16px;
-		border:1px solid rgba(255,255,255,0.08);
-		background:rgba(255,255,255,0.02);
+		border:none;
+		background:rgba(0,0,0,0.28);
 		padding:12px;
 	}
 	.episode-player {
@@ -1817,9 +2126,25 @@
 		gap:8px;
 		padding:10px;
 		border-radius:12px;
-		border:1px solid rgba(255,255,255,0.08);
-		background:rgba(0,0,0,0.28);
+		border:none;
+		background:transparent;
 		overflow:hidden;
+	}
+	.frame-number-overlay {
+		position:absolute;
+		top:10px; left:10px;
+		z-index:5;
+		font-family:monospace;
+		font-size:11px;
+		color:rgba(255,255,255,0.9);
+		background:rgba(0,0,0,0.52);
+		backdrop-filter:blur(4px);
+		-webkit-backdrop-filter:blur(4px);
+		border:1px solid rgba(255,255,255,0.1);
+		border-radius:5px;
+		padding:3px 7px;
+		pointer-events:none;
+		letter-spacing:0.03em;
 	}
 	/* Single-camera wrap — all videos in DOM for sync, only featured shown */
 	.episode-camera-wrap {
@@ -1854,7 +2179,7 @@
 	}
 	.camera-tab {
 		background:transparent;
-		border:1px solid rgba(255,255,255,0.1);
+		border:none;
 		border-radius:6px;
 		color:rgba(255,255,255,0.42);
 		font:inherit;
@@ -1862,12 +2187,11 @@
 		letter-spacing:0.01em;
 		padding:3px 9px;
 		cursor:pointer;
-		transition:color 0.12s, border-color 0.12s, background 0.12s;
+		transition:color 0.12s, background 0.12s;
 	}
-	.camera-tab:hover { color:rgba(255,255,255,0.72); border-color:rgba(255,255,255,0.18); }
+	.camera-tab:hover { color:rgba(255,255,255,0.72); }
 	.camera-tab.camera-tab-active {
 		color:rgba(255,255,255,0.88);
-		border-color:rgba(255,255,255,0.24);
 		background:rgba(255,255,255,0.05);
 	}
 	.score-overlay {
@@ -1911,11 +2235,13 @@
 		border:1px solid rgba(255,255,255,0.95);
 		box-shadow:0 0 0 2px rgba(180,235,255,0.18);
 	}
-	.episode-video-meta {
-		display:flex; align-items:center; justify-content:space-between;
-		font-size:10px; color:rgba(255,255,255,0.4);
-		padding:2px 6px 0;
-		font-family:monospace;
+	.score-loading {
+		position:absolute;
+		left:14px;
+		top:14px;
+		margin:0;
+		max-width:260px;
+		text-align:left;
 	}
 	.video-btn {
 		border:none;

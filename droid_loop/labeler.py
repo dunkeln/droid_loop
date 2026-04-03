@@ -8,8 +8,9 @@ import anthropic
 from PIL import Image
 
 from .catalog import load_moments
+from .catalog import REPO_ROOT
 
-DEFAULT_DESCRIPTIONS = Path("cluster_descriptions.json")
+DEFAULT_DESCRIPTIONS = REPO_ROOT / "cluster_descriptions.json"
 
 MODEL_ID = "claude-haiku-4-5-20251001"
 LABEL_SAMPLE_SEED = 17

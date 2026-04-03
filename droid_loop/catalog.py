@@ -14,7 +14,8 @@ import threading
 from collections.abc import Iterator
 from pathlib import Path
 
-DB_PATH = Path("catalog.db")
+REPO_ROOT = Path(__file__).resolve().parent.parent
+DB_PATH = REPO_ROOT / "catalog.db"
 
 # Keep the exported name stable for callers that import DEFAULT_CATALOG.
 DEFAULT_CATALOG = DB_PATH
@@ -63,6 +64,8 @@ CREATE TABLE IF NOT EXISTS scanned_episodes (
 CREATE TABLE IF NOT EXISTS episode_scores (
     episode_id    INTEGER PRIMARY KEY,
     score_trace   TEXT NOT NULL,
+    status        TEXT NOT NULL DEFAULT 'pending',
+    error         TEXT,
     updated_at    REAL DEFAULT (unixepoch('now', 'subsec'))
 );
 
@@ -89,7 +92,22 @@ def _connect(path: Path) -> sqlite3.Connection:
     conn = sqlite3.connect(str(path), check_same_thread=False)
     conn.row_factory = sqlite3.Row
     conn.executescript(_DDL)
+    _ensure_runtime_schema(conn)
     return conn
+
+
+def _ensure_runtime_schema(conn: sqlite3.Connection) -> None:
+    score_cols = {
+        row["name"]
+        for row in conn.execute("PRAGMA table_info(episode_scores)")
+    }
+    if "status" not in score_cols:
+        conn.execute(
+            "ALTER TABLE episode_scores ADD COLUMN status TEXT NOT NULL DEFAULT 'pending'"
+        )
+    if "error" not in score_cols:
+        conn.execute("ALTER TABLE episode_scores ADD COLUMN error TEXT")
+    conn.commit()
 
 
 def _db(path: Path = DB_PATH) -> sqlite3.Connection:
@@ -273,28 +291,65 @@ def save_episode_scores(
     db = _db(path)
     db.execute(
         """
-        INSERT OR REPLACE INTO episode_scores (episode_id, score_trace, updated_at)
-        VALUES (?, ?, unixepoch('now', 'subsec'))
+        INSERT OR REPLACE INTO episode_scores (episode_id, score_trace, status, error, updated_at)
+        VALUES (?, ?, 'ready', NULL, unixepoch('now', 'subsec'))
         """,
         (int(episode_id), json.dumps(score_trace)),
     )
     db.commit()
 
 
-def get_episode_scores(episode_id: int, path: Path = DB_PATH) -> list[dict]:
-    if not Path(path).exists():
-        return []
-    row = _db(path).execute(
+def set_episode_score_state(
+    episode_id: int,
+    status: str,
+    error: str | None = None,
+    path: Path = DB_PATH,
+) -> None:
+    db = _db(path)
+    row = db.execute(
         "SELECT score_trace FROM episode_scores WHERE episode_id = ?",
         (int(episode_id),),
     ).fetchone()
-    if row is None or row["score_trace"] is None:
-        return []
+    score_trace = row["score_trace"] if row and row["score_trace"] is not None else "[]"
+    db.execute(
+        """
+        INSERT OR REPLACE INTO episode_scores (episode_id, score_trace, status, error, updated_at)
+        VALUES (?, ?, ?, ?, unixepoch('now', 'subsec'))
+        """,
+        (int(episode_id), score_trace, status, error),
+    )
+    db.commit()
+
+
+def get_episode_score_record(episode_id: int, path: Path = DB_PATH) -> dict:
+    if not Path(path).exists():
+        return {"state": "pending", "trace": [], "error": None}
+    row = _db(path).execute(
+        "SELECT score_trace, status, error, updated_at FROM episode_scores WHERE episode_id = ?",
+        (int(episode_id),),
+    ).fetchone()
+    if row is None:
+        return {"state": "pending", "trace": [], "error": None}
     try:
-        payload = json.loads(row["score_trace"])
+        payload = json.loads(row["score_trace"] or "[]")
     except json.JSONDecodeError:
-        return []
-    return payload if isinstance(payload, list) else []
+        payload = []
+    trace = payload if isinstance(payload, list) else []
+    state = str(row["status"] or "pending")
+    # Normalize legacy or interrupted rows: a populated trace is a usable ready state.
+    if trace and state in {"pending", "scoring"}:
+        set_episode_score_state(int(episode_id), "ready", None, path)
+        state = "ready"
+    return {
+        "state": state,
+        "trace": trace,
+        "error": row["error"],
+        "updated_at": float(row["updated_at"] or 0.0),
+    }
+
+
+def get_episode_scores(episode_id: int, path: Path = DB_PATH) -> list[dict]:
+    return list(get_episode_score_record(episode_id, path).get("trace", []))
 
 
 def save_episode_media(

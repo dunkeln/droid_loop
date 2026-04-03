@@ -2,14 +2,16 @@
 	type EpisodeCard = {
 		episode_id: number;
 		thumbnail: string | null;
+		thumbnailKind: 'image' | 'video';
 		incidents: number;
 		flagged: number;
 		scanning: boolean;
 	};
 
-	let { cards, activeEp, onSelectEpisode } = $props<{
+	let { cards, activeEp, loading = false, onSelectEpisode } = $props<{
 		cards: EpisodeCard[];
 		activeEp: number | null;
+		loading?: boolean;
 		onSelectEpisode: (episodeId: number) => void;
 	}>();
 </script>
@@ -17,8 +19,10 @@
 <aside class="clips-panel">
 	<p class="panel-label">episodes</p>
 	<div class="episodes-scroll">
-		{#if cards.length === 0}
-			<p class="panel-empty">no clips yet</p>
+			{#if loading}
+				<p class="panel-empty">loading episodes…</p>
+			{:else if cards.length === 0}
+				<p class="panel-empty">no episodes yet</p>
 		{:else}
 			{#each cards as card (card.episode_id)}
 				<div
@@ -34,11 +38,24 @@
 						}
 					}}
 				>
-					<div class="clip-thumbs">
-						{#if card.thumbnail}
-							<img src={card.thumbnail} alt="" class="clip-thumb" onerror={(e)=>{ (e.target as HTMLImageElement).style.opacity='0'; }} />
-						{/if}
-						<span class="episode-overlay episode-title">episode {card.episode_id}</span>
+						<div class="clip-thumbs">
+							{#if card.thumbnail}
+								{#if card.thumbnailKind === 'video'}
+									<!-- svelte-ignore a11y_media_has_caption -->
+									<video
+										src={card.thumbnail}
+										class="clip-thumb"
+										autoplay
+										muted
+										loop
+										playsinline
+										preload="metadata"
+									></video>
+								{:else}
+									<img src={card.thumbnail} alt="" class="clip-thumb" onerror={(e)=>{ (e.target as HTMLImageElement).style.opacity='0'; }} />
+								{/if}
+							{/if}
+							<span class="episode-overlay episode-title">episode {card.episode_id}</span>
 						{#if card.flagged > 0}
 							<span class="episode-overlay episode-meta">{card.incidents} incidents · {card.flagged} flagged</span>
 						{:else if card.scanning}
@@ -57,7 +74,7 @@
 	.clips-panel {
 		width:250px; flex-shrink:0;
 		overflow:hidden; display:flex; flex-direction:column; gap:8px;
-		border-left:1px solid rgba(255,255,255,0.04);
+		border-left:none;
 		padding-left:14px; padding-right:6px;
 		background:inherit;
 		scrollbar-width:thin; scrollbar-color:rgba(255,255,255,0.08) transparent;
@@ -80,12 +97,12 @@
 	.clip-card {
 		width:100%; max-width:180px; align-self:center;
 		flex:0 0 auto;
-		border-radius:14px; border:1px solid rgba(255,255,255,0.035);
+		border-radius:14px; border:none;
 		background:inherit; cursor:pointer; overflow:hidden;
-		transition:border-color 0.15s, background-color 0.15s;
+		transition:background-color 0.15s;
 	}
-	.clip-card:hover { background-color:rgba(255,255,255,0.015); border-color:rgba(255,255,255,0.08); }
-	.clip-card.clip-active { background-color:rgba(255,255,255,0.02); border-color:rgba(255,255,255,0.1); }
+	.clip-card:hover { background-color:rgba(255,255,255,0.015); }
+	.clip-card.clip-active { background-color:rgba(255,255,255,0.02); }
 	.clip-thumbs {
 		width:100%; aspect-ratio:1/1; display:grid;
 		grid-template-columns:1fr; gap:0;

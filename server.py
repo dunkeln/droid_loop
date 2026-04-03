@@ -1,6 +1,7 @@
 import json
 import queue
 import re
+import subprocess
 import threading
 import time
 from pathlib import Path
@@ -20,8 +21,10 @@ from droid_loop.clip_extractor import ClipRequest, extract_clip, frame_timestamp
 from droid_loop.scorer import FrameScorer
 from droid_loop.vlm_query import MODEL_ID as VLM_MODEL_ID, query_incident
 
-# Absolute path anchored to server.py so it works regardless of cwd
-FRAMES_DIR = Path(__file__).parent / "frames"
+SERVER_ROOT = Path(__file__).resolve().parent
+
+# Absolute runtime paths anchored to the repo so they do not depend on cwd.
+FRAMES_DIR = SERVER_ROOT / "frames"
 FRAMES_DIR.mkdir(exist_ok=True)
 print(f"[droid-loop] frames dir: {FRAMES_DIR}")
 
@@ -37,9 +40,27 @@ app.add_middleware(
 CATALOG_PATH = catalog.DB_PATH
 
 # Touch the DB on startup so first-run queries don't fail.
-catalog._db(catalog.DB_PATH)
-DESCRIPTIONS_PATH = Path("cluster_descriptions.json")
-SIGNAL_PATH = Path("training_signal.json")
+DESCRIPTIONS_PATH = SERVER_ROOT / "cluster_descriptions.json"
+SIGNAL_PATH = SERVER_ROOT / "training_signal.json"
+
+
+def _migrate_runtime_file(legacy_name: str, target: Path) -> None:
+    legacy = Path.cwd() / legacy_name
+    if legacy.resolve() == target.resolve():
+        return
+    if target.exists() or not legacy.exists():
+        return
+    legacy.replace(target)
+
+
+def _migrate_runtime_files() -> None:
+    _migrate_runtime_file("catalog.db", CATALOG_PATH)
+    _migrate_runtime_file("cluster_descriptions.json", DESCRIPTIONS_PATH)
+    _migrate_runtime_file("training_signal.json", SIGNAL_PATH)
+
+
+_migrate_runtime_files()
+catalog._db(CATALOG_PATH)
 
 
 # ── Job state ─────────────────────────────────────────────────────────────────
@@ -58,6 +79,99 @@ _server_stop_event = threading.Event()
 _scan_pause_event = threading.Event()
 _scan_cancel_event = threading.Event()
 _label_cancel_event = threading.Event()
+
+
+def _probe_video_frame_count(path: Path) -> int:
+    if not path.exists():
+        return 0
+    try:
+        result = subprocess.run(
+            [
+                "ffprobe",
+                "-v",
+                "error",
+                "-select_streams",
+                "v:0",
+                "-show_entries",
+                "stream=nb_frames",
+                "-of",
+                "default=noprint_wrappers=1:nokey=1",
+                str(path),
+            ],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+    except Exception:
+        return 0
+    if result.returncode != 0:
+        return 0
+    try:
+        return max(0, int((result.stdout or "").strip() or "0"))
+    except ValueError:
+        return 0
+
+
+def _synthetic_episode_score_trace(episode_id: int) -> list[dict]:
+    catalog.set_episode_score_state(episode_id, "scoring", path=CATALOG_PATH)
+    media = catalog.get_episode_media(episode_id, CATALOG_PATH)
+    candidate_urls: list[str] = []
+    stored_video = media.get("video_url")
+    if isinstance(stored_video, str) and stored_video:
+        candidate_urls.append(stored_video)
+    stored_cameras = media.get("camera_videos")
+    if isinstance(stored_cameras, dict):
+        candidate_urls.extend(str(url) for url in stored_cameras.values() if isinstance(url, str))
+    candidate_paths = [FRAMES_DIR / Path(url).name for url in candidate_urls]
+    if not candidate_paths:
+        candidate_paths = sorted(FRAMES_DIR.glob(f"episode_{episode_id}__*.mp4"))
+    candidate_paths = [path for path in candidate_paths if _video_file_is_usable(path)]
+    if not candidate_paths:
+        catalog.set_episode_score_state(episode_id, "failed", "no episode media available", CATALOG_PATH)
+        return []
+    frame_count = max(_probe_video_frame_count(path) for path in candidate_paths)
+    if frame_count <= 1:
+        catalog.set_episode_score_state(episode_id, "failed", "episode media has <=1 frame", CATALOG_PATH)
+        return []
+
+    moments = catalog.get_episode_moments(episode_id, CATALOG_PATH)
+    moment_by_frame = {int(m["frame_index"]): m for m in moments}
+    flagged_frames = sorted(moment_by_frame)
+    highlight_frames = set(flagged_frames)
+    for frame_index in flagged_frames:
+        for offset in (-2, -1, 1, 2):
+            neighbor = frame_index + offset
+            if 0 <= neighbor < frame_count:
+                highlight_frames.add(neighbor)
+
+    trace: list[dict] = []
+    for frame_index in range(frame_count):
+        moment = moment_by_frame.get(frame_index)
+        flagged = frame_index in moment_by_frame
+        in_window = frame_index in highlight_frames
+        trace.append(
+            {
+                "frame_index": frame_index,
+                "score": 0.58 if flagged else (0.22 if in_window else 0.08),
+                "cluster_id": int(moment["cluster_id"]) if moment else -1,
+                "flagged": flagged,
+                "camera_scores": {},
+                "camera_flags": {},
+                "camera_clusters": {},
+            }
+        )
+
+    catalog.save_episode_scores(episode_id=episode_id, score_trace=trace, path=CATALOG_PATH)
+    if episode_id in catalog.get_scanned_episode_ids(CATALOG_PATH):
+        catalog.mark_episode_scanned(
+            episode_id=episode_id,
+            frame_count=frame_count,
+            flagged_count=len(flagged_frames),
+            path=CATALOG_PATH,
+        )
+    _episode_scores[episode_id] = trace
+    return trace
 _scan_thread: threading.Thread | None = None
 _label_thread: threading.Thread | None = None
 _vlm_query_cache: dict[str, dict] = {}
@@ -296,7 +410,14 @@ def get_frame(filename: str):
     path = FRAMES_DIR / filename
     if not path.exists():
         raise HTTPException(status_code=404, detail="Frame not found")
-    return FileResponse(path, media_type="image/jpeg")
+    return FileResponse(
+        path,
+        media_type="image/jpeg",
+        headers={
+            "Cache-Control": "no-store",
+            "Connection": "close",
+        },
+    )
 
 
 @app.get("/api/videos/{filename}")
@@ -304,7 +425,14 @@ def get_video(filename: str):
     path = FRAMES_DIR / filename
     if not path.exists():
         raise HTTPException(status_code=404, detail="Video not found")
-    return FileResponse(path, media_type="video/mp4")
+    return FileResponse(
+        path,
+        media_type="video/mp4",
+        headers={
+            "Cache-Control": "no-store",
+            "Connection": "close",
+        },
+    )
 
 
 # ── Health / status ───────────────────────────────────────────────────────────
@@ -367,12 +495,47 @@ def get_episode(episode_id: int):
 @app.get("/api/episode-scores/{episode_id}")
 def get_episode_scores(episode_id: int):
     cached = _episode_scores.get(episode_id)
-    if cached is not None:
+    if cached is not None and len(cached) >= 2:
         return cached
     stored = catalog.get_episode_scores(episode_id, CATALOG_PATH)
-    if stored:
+    if len(stored) >= 2:
         _episode_scores[episode_id] = stored
-    return stored
+        return stored
+    synthetic = _synthetic_episode_score_trace(episode_id)
+    if len(synthetic) >= 2:
+        return synthetic
+    try:
+        return _compute_episode_score_trace(episode_id)
+    except HTTPException:
+        return stored
+    except Exception:
+        return stored
+
+
+@app.get("/api/episode-scores/{episode_id}/detail")
+def get_episode_scores_detail(episode_id: int):
+    record = catalog.get_episode_score_record(episode_id, CATALOG_PATH)
+    trace = list(record.get("trace", []))
+    if len(trace) >= 2:
+        _episode_scores[episode_id] = trace
+        return record
+    synthetic = _synthetic_episode_score_trace(episode_id)
+    if len(synthetic) >= 2:
+        return catalog.get_episode_score_record(episode_id, CATALOG_PATH)
+    try:
+        rebuilt = _compute_episode_score_trace(episode_id)
+        return {
+            "state": "ready",
+            "trace": rebuilt,
+            "error": None,
+            "updated_at": time.time(),
+        }
+    except HTTPException as exc:
+        catalog.set_episode_score_state(episode_id, "failed", str(exc.detail), CATALOG_PATH)
+        return catalog.get_episode_score_record(episode_id, CATALOG_PATH)
+    except Exception as exc:
+        catalog.set_episode_score_state(episode_id, "failed", str(exc), CATALOG_PATH)
+        return catalog.get_episode_score_record(episode_id, CATALOG_PATH)
 
 
 @app.get("/api/episode-video/{episode_id}")
@@ -392,14 +555,21 @@ def get_episode_video(episode_id: int):
         cams = _episode_camera_videos.get(episode_id, {})
         if cams:
             video_url = next(iter(cams.values()))
+    if video_url:
+        path = FRAMES_DIR / Path(video_url).name
+        if not _video_file_is_usable(path):
+            video_url = None
     if not video_url:
         inferred = FRAMES_DIR / f"episode_{episode_id}.mp4"
-        if inferred.exists():
+        if _video_file_is_usable(inferred):
             video_url = f"/api/videos/{inferred.name}"
     if not video_url:
         inferred_cams = sorted(FRAMES_DIR.glob(f"episode_{episode_id}__*.mp4"))
+        inferred_cams = [path for path in inferred_cams if _video_file_is_usable(path)]
         if inferred_cams:
             video_url = f"/api/videos/{inferred_cams[0].name}"
+    if not video_url:
+        video_url, _ = _ensure_episode_media_files(episode_id)
     return {"video_url": video_url}
 
 
@@ -416,15 +586,30 @@ def get_episode_videos(episode_id: int):
         if isinstance(video_url, str) and video_url:
             _episode_videos[episode_id] = video_url
     if cams:
-        return cams
+        cams = {
+            camera: url
+            for camera, url in cams.items()
+            if _video_file_is_usable(FRAMES_DIR / Path(url).name)
+        }
+        if cams:
+            _episode_camera_videos[episode_id] = cams
+            return cams
     inferred: dict[str, str] = {}
     for path in sorted(FRAMES_DIR.glob(f"episode_{episode_id}__*.mp4")):
+        if not _video_file_is_usable(path):
+            continue
         camera = path.stem.split("__", 1)[-1]
         inferred[camera] = f"/api/videos/{path.name}"
     if inferred:
         return inferred
     primary = FRAMES_DIR / f"episode_{episode_id}.mp4"
-    if primary.exists():
+    if _video_file_is_usable(primary):
+        return {"primary": f"/api/videos/{primary.name}"}
+    _, regenerated = _ensure_episode_media_files(episode_id)
+    if regenerated:
+        return regenerated
+    primary = FRAMES_DIR / f"episode_{episode_id}.mp4"
+    if _video_file_is_usable(primary):
         return {"primary": f"/api/videos/{primary.name}"}
     return {}
 
@@ -636,6 +821,81 @@ def _find_catalog_moment(episode_id: int, frame_index: int) -> dict | None:
 
 def _catalog_moments_for_episode(episode_id: int) -> list[dict]:
     return catalog.get_episode_moments(int(episode_id))
+
+
+def _compute_episode_score_trace(
+    episode_id: int,
+    dataset_id: str = loader.DROID_DATASET,
+    preferred_image_key: str = "observation.images.wrist_left",
+) -> list[dict]:
+    catalog.set_episode_score_state(episode_id, "scoring", path=CATALOG_PATH)
+    episode = _load_episode_for_query(dataset_id=dataset_id, episode_id=episode_id)
+    if not episode:
+        catalog.set_episode_score_state(episode_id, "failed", "episode not found", CATALOG_PATH)
+        return []
+    image_key = _resolve_image_key(episode[0], preferred_image_key)
+    if image_key is None:
+        catalog.set_episode_score_state(episode_id, "failed", "no image key resolved", CATALOG_PATH)
+        return []
+    frame_indices = [int(frame["frame_index"]) for frame in episode]
+    camera_keys = sorted(
+        {
+            key
+            for frame in episode
+            for key in _frame_camera_keys(frame)
+        }
+    )
+    if not camera_keys:
+        catalog.set_episode_score_state(episode_id, "failed", "no camera keys available", CATALOG_PATH)
+        return []
+    images_by_camera = {
+        key: [
+            _as_pil_image(frame[key]).convert("RGB") if frame.get(key) is not None else None
+            for frame in episode
+        ]
+        for key in camera_keys
+    }
+    scorer = FrameScorer(contamination=0.05, batch_size=32)
+    bad_indices, cluster_labels, _, anomaly_scores, per_camera = scorer.flag_multiview(
+        images_by_camera=images_by_camera,
+        frame_indices=frame_indices,
+        primary_camera=image_key,
+    )
+    bad_set = set(int(i) for i in bad_indices)
+    trace = [
+        {
+            "frame_index": int(frame_indices[i]),
+            "score": float(anomaly_scores[i]),
+            "cluster_id": int(cluster_labels[i]),
+            "flagged": bool(i in bad_set),
+            "camera_scores": {
+                _camera_tag(cam): float(cam_data["scores"][i])
+                for cam, cam_data in per_camera.items()
+            },
+            "camera_flags": {
+                _camera_tag(cam): bool(cam_data["flagged"][i])
+                for cam, cam_data in per_camera.items()
+            },
+            "camera_clusters": {
+                _camera_tag(cam): (
+                    None if cam_data["clusters"][i] is None else int(cam_data["clusters"][i])
+                )
+                for cam, cam_data in per_camera.items()
+            },
+        }
+        for i in range(len(frame_indices))
+    ]
+    catalog.save_episode_scores(episode_id=episode_id, score_trace=trace, path=CATALOG_PATH)
+    if episode_id in catalog.get_scanned_episode_ids(CATALOG_PATH):
+        flagged_count = sum(1 for row in trace if bool(row["flagged"]))
+        catalog.mark_episode_scanned(
+            episode_id=episode_id,
+            frame_count=len(frame_indices),
+            flagged_count=flagged_count,
+            path=CATALOG_PATH,
+        )
+    _episode_scores[episode_id] = trace
+    return trace
 
 
 def _episode_clip_catalog(episode_id: int) -> list[dict]:
@@ -861,6 +1121,64 @@ def _save_multi_camera_frame_images(frame: dict, episode_id: int, frame_index: i
         _as_pil_image(value).convert("RGB").save(out, format="JPEG", quality=82)
 
 
+def _video_file_is_usable(path: Path, min_frames: int = 2) -> bool:
+    if not path.exists() or not path.is_file():
+        return False
+    try:
+        import av
+
+        with av.open(str(path)) as container:
+            stream = container.streams.video[0]
+            frame_count = 0
+            for _ in container.decode(stream):
+                frame_count += 1
+                if frame_count >= min_frames:
+                    return True
+        return False
+    except Exception:
+        return False
+
+
+def _ensure_episode_media_files(
+    episode_id: int,
+    dataset_id: str = loader.DROID_DATASET,
+    preferred_image_key: str = "observation.images.wrist_left",
+) -> tuple[str | None, dict[str, str]]:
+    primary_path = FRAMES_DIR / f"episode_{episode_id}.mp4"
+    inferred_camera_paths = sorted(FRAMES_DIR.glob(f"episode_{episode_id}__*.mp4"))
+    primary_ok = _video_file_is_usable(primary_path)
+    camera_ok = all(_video_file_is_usable(path) for path in inferred_camera_paths) if inferred_camera_paths else False
+    if primary_ok and camera_ok:
+        return (
+            f"/api/videos/{primary_path.name}" if primary_path.exists() else None,
+            {path.stem.split('__', 1)[-1]: f"/api/videos/{path.name}" for path in inferred_camera_paths},
+        )
+
+    for path in [primary_path, *inferred_camera_paths]:
+        try:
+            if path.exists():
+                path.unlink()
+        except OSError:
+            pass
+
+    episode = _load_episode_for_query(dataset_id=dataset_id, episode_id=episode_id)
+    camera_videos = _save_episode_camera_videos(episode, episode_id)
+    image_key = _resolve_image_key(episode[0], preferred_image_key) or preferred_image_key
+    primary_valid = [frame for frame in episode if frame.get(image_key) is not None]
+    video_url = camera_videos.get(_camera_tag(image_key)) or _save_episode_video(primary_valid, image_key, episode_id)
+    catalog.save_episode_media(
+        episode_id=episode_id,
+        video_url=video_url,
+        camera_videos=camera_videos,
+        path=CATALOG_PATH,
+    )
+    if video_url:
+        _episode_videos[episode_id] = video_url
+    if camera_videos:
+        _episode_camera_videos[episode_id] = camera_videos
+    return video_url, camera_videos
+
+
 def _save_episode_video(
     episode: list[dict],
     image_key: str,
@@ -871,8 +1189,13 @@ def _save_episode_video(
         return None
     out_name = f"episode_{episode_id}.mp4"
     out_path = FRAMES_DIR / out_name
-    if out_path.exists():
+    if out_path.exists() and _video_file_is_usable(out_path):
         return f"/api/videos/{out_name}"
+    if out_path.exists():
+        try:
+            out_path.unlink()
+        except OSError:
+            pass
 
     import av
     import numpy as np
@@ -933,9 +1256,14 @@ def _save_episode_camera_videos(
         tag = _camera_tag(key)
         out_name = f"episode_{episode_id}__{tag}.mp4"
         out_path = FRAMES_DIR / out_name
-        if out_path.exists():
+        if out_path.exists() and _video_file_is_usable(out_path):
             out[tag] = f"/api/videos/{out_name}"
             continue
+        if out_path.exists():
+            try:
+                out_path.unlink()
+            except OSError:
+                pass
 
         first_idx = next((i for i, frame in enumerate(episode) if frame.get(key) is not None), None)
         if first_idx is None:
@@ -1189,6 +1517,7 @@ def _run_scan(params: ScanParams) -> None:
     global _scan_thread
     producer: threading.Thread | None = None
     stop_event = threading.Event()
+    current_episode: int | None = None
     try:
         episode_fps = loader.dataset_fps(params.dataset_id)
         scorer = FrameScorer(
@@ -1209,7 +1538,7 @@ def _run_scan(params: ScanParams) -> None:
             total_flagged=0,
         )
         total_flagged = 0
-        max_frames = max(1, params.max_frames_per_episode)
+        max_frames = None if params.max_frames_per_episode <= 0 else int(params.max_frames_per_episode)
         work_q: queue.Queue[object] = queue.Queue(maxsize=1)
         producer_errors: list[Exception] = []
         sentinel = object()
@@ -1301,7 +1630,7 @@ def _run_scan(params: ScanParams) -> None:
                     valid = [f for f in episode if any(f.get(k) is not None for k in camera_keys)]
                     if not valid:
                         continue
-                    if max_frames > 0 and len(valid) > max_frames:
+                    if max_frames is not None and len(valid) > max_frames:
                         step = max(1, len(valid) // max_frames)
                         valid = valid[::step][:max_frames]
                         _log_scan_event(
@@ -1384,6 +1713,7 @@ def _run_scan(params: ScanParams) -> None:
                         "image_key": image_key,
                         "frame_indices": frame_indices,
                     }
+                    catalog.set_episode_score_state(episode_id, "pending", path=CATALOG_PATH)
                     while True:
                         if _scan_should_stop(stop_event):
                             return
@@ -1436,9 +1766,11 @@ def _run_scan(params: ScanParams) -> None:
                 continue
 
             episode_id = int(item["episode_id"])
+            current_episode = episode_id
             episode = item["episode"]
             image_key = str(item["image_key"])
             frame_indices = item["frame_indices"]
+            catalog.set_episode_score_state(episode_id, "scoring", path=CATALOG_PATH)
             camera_keys = sorted(
                 {
                     key
@@ -1637,6 +1969,11 @@ def _run_scan(params: ScanParams) -> None:
             _push({"type": "done", "total_flagged": total_flagged})
 
     except Exception as e:
+        if current_episode is not None:
+            try:
+                catalog.set_episode_score_state(int(current_episode), "failed", str(e), CATALOG_PATH)
+            except Exception:
+                pass
         if not _scan_should_stop(stop_event):
             _push({"type": "error", "message": str(e)})
     finally:

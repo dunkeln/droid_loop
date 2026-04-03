@@ -20,7 +20,11 @@ class FrameScorer:
         self.processor = AutoProcessor.from_pretrained(model_id)
         self.model = AutoModel.from_pretrained(model_id)
         self.model.eval()
-        self.detector = IsolationForest(contamination=contamination, random_state=42)
+        self.detector = IsolationForest(
+            contamination=contamination,
+            random_state=42,
+            n_jobs=1,
+        )
         self.batch_size = max(1, batch_size)
         self.temporal_jump_weight = float(min(0.95, max(0.0, temporal_jump_weight)))
         self.jump_flag_quantile = float(min(0.999, max(0.5, jump_flag_quantile)))
@@ -55,7 +59,11 @@ class FrameScorer:
         """Cluster embeddings into semantic groups. Returns cluster labels (-1 = noise/anomaly)."""
         min_size = max(5, len(embeddings) // 20)
         # Pin copy behavior to avoid sklearn FutureWarning and keep current semantics.
-        return HDBSCAN(min_cluster_size=min_size, copy=False).fit_predict(embeddings)
+        return HDBSCAN(
+            min_cluster_size=min_size,
+            copy=False,
+            n_jobs=1,
+        ).fit_predict(embeddings)
 
     def _cluster_meta(
         self, cluster_labels: np.ndarray, frame_indices: list[int]
