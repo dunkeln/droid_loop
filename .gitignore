@@ -1,0 +1,23 @@
+.venv/
+__pycache__/
+*.pyc
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+dist/
+build/
+.DS_Store
+.env
+.env.*
+
+# UI build/runtime
+ui/node_modules/
+ui/.svelte-kit/
+ui/build/
+ui/dist/
+
+# Local runtime state
+catalog.db
+training_signal.json
+cluster_descriptions.json
+frames/

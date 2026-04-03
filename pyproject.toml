@@ -1,0 +1,31 @@
+[tool.uv]
+package = true
+
+[tool.setuptools.packages.find]
+include = ["droid_loop*"]
+
+[project]
+name = "droid-loop"
+version = "0.1.0"
+description = "Surface rare moments from DROID robot videos for training signal"
+readme = "README.md"
+requires-python = ">=3.13"
+dependencies = [
+    "datasets",
+    "typer",
+    "transformers",
+    "scikit-learn",
+    "torch",
+    "Pillow",
+    "sentencepiece>=0.2.1",
+    "protobuf>=7.34.1",
+    "python-dotenv",
+    "anthropic",
+    "fastapi[standard]",
+    "av",
+    "psutil>=7.2.2",
+    "pyarrow",
+]
+
+[project.scripts]
+droid-loop = "droid_loop.cli:app"
