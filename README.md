@@ -8,4 +8,3 @@ The labeling path uses VLM descriptions only after mining, so semantic cost stay
 The export path converts validated incidents into flywheel-ready signal artifacts.
 State is durable across graceful restarts through `catalog.db` plus retained review media in `frames/`.
 Run the API with `uv run uvicorn server:app --host 127.0.0.1 --port 8000` and the UI from `ui/`.
-See [GUIDE.md](/Users/prateek/code/robotics/droid_loop/GUIDE.md) for setup, controls, contracts, and architecture.
