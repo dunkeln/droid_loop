@@ -81,6 +81,8 @@
 		cached: boolean;
 		model: string;
 		attempts: number;
+		incident: string | null;
+		context: string | null;
 		result: {
 			incident_type: string;
 			failure_mode: string;
@@ -97,7 +99,7 @@
 			total_tokens: number;
 			accumulated_total_tokens: number;
 		};
-		context?: {
+		chat_context?: {
 			history_tokens_est: number;
 			history_compacted: boolean;
 			history_messages: number;
@@ -120,7 +122,22 @@
 			end_frame_index: number;
 		}[];
 	};
-	type ChatTurn = { role: 'user' | 'assistant'; content: string; ts: number };
+	type ChatCitation = {
+		episode_id: number;
+		frame_index: number;
+		frame_start?: number;
+		frame_end?: number;
+		camera?: string;
+		cluster_id?: number;
+	};
+	type ChatTurn = {
+		role: 'user' | 'assistant';
+		content: string;
+		ts: number;
+		incident?: string | null;
+		citation?: ChatCitation;
+		status?: string;
+	};
 	type EpisodeSidebarCard = {
 		episode_id: number;
 		thumbnail: string | null;
@@ -207,11 +224,6 @@
 	let episodeClipReq = 0;
 	let catalogLoadReq = 0;
 	let catalogLoading = $state(true);
-	let inspectorOpen = $state(false);
-	let inspectorExpanded = $state(false);
-	let inspectorQuestion = $state('');
-	let inspectorAnswer = $state('');
-	let inspectorTimer: ReturnType<typeof setTimeout> | null = null;
 	let viewportMode = $state<'main' | 'chat'>('main');
 
 	// Jobs
@@ -299,7 +311,6 @@
 			for (const timer of episodeScoreRetryTimers.values()) clearTimeout(timer);
 			episodeScoreRetryTimers.clear();
 			stopVideoAnimationLoop();
-			if (inspectorTimer) clearTimeout(inspectorTimer);
 		};
 	});
 
@@ -312,18 +323,43 @@
 		}
 	}
 
-	function setInspectorActive() {
-		inspectorOpen = true;
-		if (inspectorTimer) clearTimeout(inspectorTimer);
-		inspectorTimer = setTimeout(() => {
-			inspectorExpanded = false;
-		}, 8000);
+	function latestAssistantIncident(): string | null {
+		for (let i = chatHistory.length - 1; i >= 0; i -= 1) {
+			const turn = chatHistory[i];
+			if (turn.role !== 'assistant') continue;
+			const value = turn.incident?.trim();
+			if (value) return value;
+		}
+		return null;
 	}
 
-	function toggleInspectorExpanded() {
-		inspectorExpanded = !inspectorExpanded;
-		setInspectorActive();
+	function latestAssistantPreview(): string | null {
+		const compact = latestAssistantIncident();
+		if (!compact) return null;
+		return compact;
 	}
+
+	function openLatestChat() {
+		viewportMode = 'chat';
+		requestAnimationFrame(() => {
+			const el = document.getElementById('chat-log-scroll');
+			if (el) el.scrollTop = el.scrollHeight;
+		});
+	}
+
+	async function validateCitation(citation: ChatCitation, verdict: 'approved' | 'rejected') {
+		const clip = clips.get(citation.episode_id);
+		if (!clip) return;
+		const start = citation.frame_start ?? citation.frame_index;
+		const end = citation.frame_end ?? citation.frame_index;
+		const moment =
+			clip.moments.find((m) => m.frame_index === citation.frame_index) ??
+			clip.moments.find((m) => m.frame_index >= start && m.frame_index <= end) ??
+			clip.moments[0];
+		if (!moment) return;
+		await validate(moment, verdict);
+	}
+
 
 	$effect(() => {
 		const m = selMoment;
@@ -1426,21 +1462,21 @@
 			syncVideoUiState();
 		}
 
-		function onReviewVideoLoaded(camera: string) {
-			if (!isFeaturedReviewCamera(camera)) return;
-			bindActiveReviewVideo(camera);
-		}
+	function onReviewVideoLoaded(camera: string) {
+		if (!isFeaturedReviewCamera(camera)) return;
+		bindActiveReviewVideo(camera);
+	}
 
-		function onReviewVideoTimeUpdate(camera: string) {
-			if (!isFeaturedReviewCamera(camera)) return;
-			const el = cameraVideoEls[camera];
+	function onReviewVideoTimeUpdate(camera: string) {
+		if (!isFeaturedReviewCamera(camera)) return;
+		const el = cameraVideoEls[camera];
 			if (!el) return;
-			if (episodeVideoEl !== el) episodeVideoEl = el;
-			episodeDuration = Number.isFinite(el.duration) ? el.duration : episodeDuration;
-			episodeCurrentTime = el.currentTime;
-			updateEpisodeFrameState();
-			syncVideoUiState();
-		}
+		if (episodeVideoEl !== el) episodeVideoEl = el;
+		episodeDuration = Number.isFinite(el.duration) ? el.duration : episodeDuration;
+		episodeCurrentTime = el.currentTime;
+		updateEpisodeFrameState();
+		syncVideoUiState();
+	}
 
 		function reviewLoadingText(clip: Clip): string | null {
 			const scoreState = episodeScoreState(clip);
@@ -1539,12 +1575,9 @@
 			scanStatus = 'select an episode before querying VLM';
 			return;
 		}
-		inspectorQuestion = question;
 		pushChatTurn({ role: 'user', content: question, ts: Date.now() });
 		const req = ++vlmReq;
 		vlmBusy = true;
-		inspectorAnswer = 'querying…';
-		setInspectorActive();
 		scanStatus = 'vlm querying…';
 		const camera = featuredCamera(clip);
 		const currentClipRef = currentEpisodeClipRef(clip);
@@ -1567,19 +1600,33 @@
 			if (!r.ok) throw new Error(data?.detail ?? 'vlm query failed');
 			if (req !== vlmReq) return;
 			lastVlmResponse = data as VlmQueryResponse;
-			inspectorAnswer = `${data.result.incident_type}: ${data.result.summary}`;
-			scanStatus = `vlm · ${data.result.incident_type} (${Math.round(data.result.confidence * 100)}%)`;
+			const incident = data.incident?.trim() || latestAssistantIncident();
+			scanStatus = incident ? `vlm · ${incident}` : 'vlm response';
 			pushChatTurn({
 				role: 'assistant',
-				content: `${data.result.incident_type}: ${data.result.summary}`,
-				ts: Date.now()
+				content: data.context ?? '',
+				ts: Date.now(),
+				incident: data.incident?.trim() || null,
+				citation: {
+					episode_id: payload.episode_id,
+					frame_index: payload.frame_index,
+					frame_start: currentClipRef?.start_frame_index ?? payload.frame_index,
+					frame_end: currentClipRef?.end_frame_index ?? payload.frame_index,
+					camera: payload.camera,
+					cluster_id:
+						clip.moments.find((m) =>
+							currentClipRef
+								? m.frame_index >= currentClipRef.start_frame_index && m.frame_index <= currentClipRef.end_frame_index
+								: m.frame_index === payload.frame_index
+						)?.cluster_id
+				},
+				status: currentClipRef
+					? `clip ${currentClipRef.ordinal}/${Math.max(episodeClipRefs[clip.episode_id]?.length ?? 1, 1)}`
+					: undefined
 			});
-			setInspectorActive();
 		} catch (err) {
 			if (req !== vlmReq) return;
-			inspectorAnswer = `error: ${err instanceof Error ? err.message : 'query failed'}`;
 			scanStatus = `vlm ✕ ${err instanceof Error ? err.message : 'query failed'}`;
-			setInspectorActive();
 		} finally {
 			if (req === vlmReq) vlmBusy = false;
 		}
@@ -1623,11 +1670,12 @@
 			{currentEpisode}
 			{liveStatus}
 			{vlmBusy}
-			{lastVlmResponse}
+			latestVlmPreview={latestAssistantPreview()}
 			{exportMsg}
 			onScan={onScanButton}
 			onLabel={startLabel}
 			onExport={doExport}
+			onOpenLatestChat={openLatestChat}
 			{scanButtonLabel}
 		/>
 	{/if}
@@ -1939,80 +1987,9 @@
 		/>
 
 	{:else}
-		<ChatLog {chatHistory} {vlmBusy} />
+		<ChatLog {chatHistory} {vlmBusy} onValidateCitation={validateCitation} />
 	{/if}
 	</div>
-
-	{#if inspectorOpen && (inspectorQuestion || inspectorAnswer)}
-		<div class="inspector-sheet" class:expanded={inspectorExpanded}>
-			<button class="inspector-head" onclick={toggleInspectorExpanded} aria-label="Toggle insight sheet">
-				<span>insight</span>
-				<span>
-					{#if vlmBusy}working…{:else if inspectorExpanded}collapse{:else}expand{/if}
-				</span>
-			</button>
-			<div class="inspector-body">
-				<p class="inspector-question">{inspectorQuestion || '—'}</p>
-
-				{#if lastVlmResponse?.resolved_clip}
-					{@const rc = lastVlmResponse.resolved_clip}
-					{@const total = lastVlmResponse.episode_clips?.length ?? 1}
-					<p class="inspector-clip-ref">
-						clip {rc.ordinal}/{total} · frames {rc.start_frame_index}–{rc.end_frame_index}
-						{#if rc.start_timestamp_s != null && rc.end_timestamp_s != null}
-							· {rc.start_timestamp_s.toFixed(1)}s–{rc.end_timestamp_s.toFixed(1)}s
-						{/if}
-					</p>
-				{/if}
-
-				<p class="inspector-answer">{inspectorAnswer || '—'}</p>
-
-				{#if lastVlmResponse}
-					<div class="inspector-meta">
-						<span class="conf-badge" style="opacity:{0.4 + lastVlmResponse.result.confidence * 0.6}">
-							{Math.round(lastVlmResponse.result.confidence * 100)}% conf
-						</span>
-						<span>{lastVlmResponse.result.failure_mode}</span>
-						{#if lastVlmResponse.token_usage}
-							<span class="tok-count">+{lastVlmResponse.token_usage.total_tokens} tok</span>
-						{/if}
-					</div>
-
-					{#if lastVlmResponse.result.actionability}
-						<p class="inspector-actionability">{lastVlmResponse.result.actionability}</p>
-					{/if}
-
-					{#if lastVlmResponse.result.recommendations?.length}
-						<ul class="inspector-recs">
-							{#each lastVlmResponse.result.recommendations as rec}
-								<li>{rec}</li>
-							{/each}
-						</ul>
-					{/if}
-
-					{#if (lastVlmResponse.episode_clips?.length ?? 0) > 1}
-						<div class="inspector-clip-nav">
-							{#each (lastVlmResponse.episode_clips ?? []) as ec}
-								<button
-									class="clip-nav-chip"
-									class:clip-nav-active={lastVlmResponse.resolved_clip?.id === ec.id}
-									onclick={() => {
-										if (activeClip) {
-											selMoment = activeClip.moments.find(m => m.frame_index >= ec.start_frame_index && m.frame_index <= ec.end_frame_index) ?? activeClip.moments[0] ?? null;
-										}
-									}}
-								>clip {ec.ordinal}</button>
-							{/each}
-						</div>
-					{/if}
-				{/if}
-
-				{#if Math.floor(chatHistory.length / 2) > 1}
-					<p class="inspector-history">{Math.floor(chatHistory.length / 2)} exchanges in context{#if lastVlmResponse?.context?.history_compacted} · compacted{/if}</p>
-				{/if}
-			</div>
-		</div>
-	{/if}
 </div>
 
 <style>
@@ -2202,10 +2179,24 @@
 		padding:48px 10px 8px;
 		background:linear-gradient(180deg, rgba(0,0,0,0) 0%, rgba(0,0,0,0.28) 28%, rgba(0,0,0,0.56) 100%);
 		pointer-events:none;
+		user-select:none;
+		-webkit-user-select:none;
+		-webkit-touch-callout:none;
+		-webkit-tap-highlight-color:transparent;
 	}
 	.score-overlay .score-timeline { pointer-events:auto; }
 	:global(.score-overlay figure) { margin:0; }
 	:global(.score-overlay svg) { width:100%; display:block; }
+	:global(.score-overlay *),
+	:global(.score-overlay svg *),
+	:global(.score-overlay .score-timeline),
+	:global(.score-overlay .score-timeline *) {
+		user-select:none;
+		-webkit-user-select:none;
+		-webkit-touch-callout:none;
+		-webkit-tap-highlight-color:transparent;
+		outline:none;
+	}
 	.score-timeline {
 		position:relative;
 		height:6px;
@@ -2336,127 +2327,4 @@
 		.detail-frame-box.last-odd { grid-column:auto; width:100%; }
 	}
 
-	.inspector-sheet {
-		position:absolute;
-		left:50%;
-		bottom:12px;
-		transform:translateX(-50%) translateY(12px);
-		width:min(760px, calc(100% - 28px));
-		border:1px solid rgba(255,255,255,0.14);
-		background:
-			linear-gradient(180deg, rgba(255,255,255,0.14) 0%, rgba(255,255,255,0.06) 100%),
-			linear-gradient(120deg, rgba(255,255,255,0.08) 0%, rgba(255,255,255,0.02) 46%, rgba(255,255,255,0.05) 100%);
-		border-radius:14px;
-		z-index:16;
-		opacity:0.95;
-		transition:transform 0.2s ease, opacity 0.2s ease, border-color 0.2s ease;
-		backdrop-filter:blur(34px) saturate(170%);
-		-webkit-backdrop-filter:blur(34px) saturate(170%);
-		box-shadow:
-			0 18px 40px rgba(0,0,0,0.26),
-			inset 0 1px 0 rgba(255,255,255,0.22),
-			inset 0 -1px 0 rgba(255,255,255,0.06);
-	}
-	.inspector-sheet.expanded {
-		transform:translateX(-50%) translateY(0);
-		opacity:1;
-		border-color:rgba(255,255,255,0.2);
-	}
-	.inspector-head {
-		width:100%;
-		display:flex;
-		align-items:center;
-		justify-content:space-between;
-		gap:12px;
-		padding:8px 12px;
-		border:none;
-		background:transparent;
-		color:rgba(255,255,255,0.78);
-		font-size:11px;
-		letter-spacing:0.05em;
-		text-transform:lowercase;
-		cursor:pointer;
-		border-bottom:1px solid rgba(255,255,255,0.08);
-	}
-	.inspector-body {
-		padding:0 12px 10px;
-		display:grid;
-		gap:6px;
-		max-height:0;
-		overflow:hidden;
-		transition:max-height 0.2s ease;
-	}
-	.inspector-sheet.expanded .inspector-body { max-height:220px; }
-	.inspector-question {
-		margin:0;
-		font-size:11px;
-		color:rgba(255,255,255,0.66);
-		white-space:nowrap;
-		overflow:hidden;
-		text-overflow:ellipsis;
-	}
-	.inspector-answer {
-		margin:0;
-		font-size:12px;
-		color:rgba(255,255,255,0.9);
-		line-height:1.3;
-		line-clamp:2;
-		display:-webkit-box;
-		-webkit-line-clamp:2;
-		-webkit-box-orient:vertical;
-		overflow:hidden;
-	}
-	.inspector-meta {
-		display:flex;
-		align-items:center;
-		gap:10px;
-		font-size:10px;
-		color:rgba(255,255,255,0.7);
-		font-family:monospace;
-	}
-	.inspector-clip-ref {
-		margin:0;
-		font-size:10px;
-		color:rgba(140,180,255,0.75);
-		font-family:monospace;
-	}
-	.inspector-actionability {
-		margin:0;
-		font-size:11px;
-		color:rgba(255,255,255,0.5);
-		font-style:italic;
-	}
-	.inspector-recs {
-		margin:2px 0 0 0;
-		padding-left:14px;
-		font-size:11px;
-		color:rgba(255,255,255,0.65);
-		line-height:1.5;
-	}
-	.inspector-recs li { margin:0; }
-	.inspector-clip-nav {
-		display:flex;
-		gap:4px;
-		flex-wrap:wrap;
-	}
-	.clip-nav-chip {
-		padding:2px 8px;
-		border-radius:999px;
-		border:1px solid rgba(255,255,255,0.1);
-		background:transparent;
-		color:rgba(255,255,255,0.4);
-		font-size:10px;
-		font-family:inherit;
-		cursor:pointer;
-		transition:background 0.1s, color 0.1s;
-	}
-	.clip-nav-chip:hover { background:rgba(255,255,255,0.06); color:rgba(255,255,255,0.75); }
-	.clip-nav-chip.clip-nav-active { background:rgba(255,255,255,0.1); color:rgba(255,255,255,0.9); border-color:rgba(255,255,255,0.22); }
-	.conf-badge { font-family:monospace; }
-	.tok-count { color:rgba(255,255,255,0.3); }
-	.inspector-history {
-		margin:0;
-		font-size:10px;
-		color:rgba(255,255,255,0.35);
-	}
 </style>

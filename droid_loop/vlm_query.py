@@ -111,6 +111,17 @@ def _prompt_schema(user_query: str | None, clip_metadata: dict | None = None) ->
     context_block = _build_clip_context_block(clip_metadata)
     return (
         f"{context_block} "
+        "You are evaluating robot behavior for safety, task correctness, and unintended failure. "
+        "Do not assume that contact, grasping, lifting, transport, or placement is bad by default. "
+        "These are often normal robot actions. "
+        "Only call something an incident if the frames show evidence of unsafe, unintended, abnormal, "
+        "or task-breaking behavior such as collision, drop, spill, slip, misgrasp, object damage, "
+        "wrong-object interaction, unstable motion, or contact that is clearly inappropriate in context. "
+        "If the behavior looks like normal planned manipulation and there is no clear evidence of failure, "
+        'set "incident_type" to "none", set "failure_mode" to "none", explain briefly why the action appears '
+        'normal in "summary", set "actionability" to "no issue visible", and keep "recommendations" empty. '
+        "Prefer being conservative: do not label a routine grasp as bad unless the visual evidence supports that conclusion. "
+        "Focus on cause and consequence, not mere motion or contact. "
         "Return ONLY one JSON object with keys exactly:\n"
         "{"
         '"incident_type": string,'
@@ -130,7 +141,7 @@ def _tool_spec() -> dict:
     return {
         "name": "respond_incident_json",
         "description": (
-            "Return the final incident analysis as structured JSON after analyzing the provided clip frames."
+            "Return the final structured analysis for the clip. Use incident_type='none' when the robot behavior appears normal and no clear failure or unsafe action is visible."
         ),
         "input_schema": {
             "type": "object",

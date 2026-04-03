@@ -1493,6 +1493,8 @@ def vlm_query(payload: VlmQueryRequest):
         "episode_clips": all_episode_clips,
         "model": payload.model_id,
         "attempts": result.attempts,
+        "incident": result.result.incident_type,
+        "context": (result.result.summary or "").strip() or None,
         "result": result.result.model_dump(),
         "raw_text": result.raw_text,
         "token_usage": {
@@ -1501,7 +1503,7 @@ def vlm_query(payload: VlmQueryRequest):
             "total_tokens": int(result.input_tokens + result.output_tokens),
             "accumulated_total_tokens": int(_vlm_token_totals["total_tokens"]),
         },
-        "context": {
+        "chat_context": {
             "history_tokens_est": history_tokens,
             "history_compacted": history_compacted,
             "history_messages": len(compacted_history),

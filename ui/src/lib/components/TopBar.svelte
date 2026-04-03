@@ -12,13 +12,6 @@
 		};
 	};
 
-	type LastVlm = {
-		model: string;
-		result: { failure_mode: string };
-		token_usage?: { total_tokens: number; accumulated_total_tokens: number };
-		context?: { history_tokens_est: number; context_token_limit: number; history_compacted?: boolean };
-	};
-
 	let {
 		jobRunning,
 		clipsSize,
@@ -28,11 +21,12 @@
 		currentEpisode,
 		liveStatus,
 		vlmBusy,
-		lastVlmResponse,
+		latestVlmPreview,
 		exportMsg,
 		onScan,
 		onLabel,
 		onExport,
+		onOpenLatestChat,
 		scanButtonLabel
 	} = $props<{
 		jobRunning: 'scan' | 'label' | null;
@@ -43,13 +37,18 @@
 		currentEpisode: number | null;
 		liveStatus: LiveStatus | null;
 		vlmBusy: boolean;
-		lastVlmResponse: LastVlm | null;
+		latestVlmPreview: string | null;
 		exportMsg: string | null;
 		onScan: () => void;
 		onLabel: () => void;
 		onExport: () => void;
+		onOpenLatestChat: () => void;
 		scanButtonLabel: () => string;
 	}>();
+
+	function isVlmStatus(value: string): boolean {
+		return value.startsWith('vlm ');
+	}
 </script>
 
 <div class="topbar">
@@ -64,7 +63,7 @@
 			export
 		</button>
 	</div>
-	{#if scanStatus}
+	{#if scanStatus && !isVlmStatus(scanStatus)}
 		<span class="status-line">{scanStatus}</span>
 	{/if}
 	{#if scanning}
@@ -85,19 +84,10 @@
 	{#if vlmBusy}
 		<span class="status-line phase">vlm querying…</span>
 	{/if}
-	{#if lastVlmResponse}
-		<span class="status-line">vlm {lastVlmResponse.model} · {lastVlmResponse.result.failure_mode}</span>
-	{/if}
-	{#if lastVlmResponse?.context}
-		<span class="status-line">
-			ctx {lastVlmResponse.context.history_tokens_est}/{lastVlmResponse.context.context_token_limit} tok
-			{#if lastVlmResponse.context.history_compacted} · compacted{/if}
-		</span>
-	{/if}
-	{#if lastVlmResponse?.token_usage}
-		<span class="status-line">
-			tok +{lastVlmResponse.token_usage.total_tokens} · total {lastVlmResponse.token_usage.accumulated_total_tokens}
-		</span>
+	{#if latestVlmPreview}
+		<button class="status-line status-link" onclick={onOpenLatestChat} title="Open latest chat">
+			<strong class="status-link-label">incident</strong> {latestVlmPreview}
+		</button>
 	{/if}
 	{#if exportMsg}
 		<span class="export-msg" class:ok={exportMsg.startsWith('✓')}>{exportMsg}</span>
@@ -136,6 +126,17 @@
 	.status-line { font-size:11.5px; font-family:monospace; color:rgba(255,255,255,0.45); }
 	.status-line.phase { color:rgba(120,200,255,0.78); }
 	.status-line.live { color:rgba(255,255,255,0.58); white-space:nowrap; }
+	.status-link {
+		border:none;
+		background:transparent;
+		padding:0;
+		cursor:pointer;
+	}
+	.status-link-label {
+		font-weight:700;
+		color:rgba(255,255,255,0.78);
+	}
+	.status-link:hover { color:rgba(255,255,255,0.72); }
 	.export-msg  { font-size:11.5px; color:rgba(255,255,255,0.3); }
 	.export-msg.ok { color:rgba(120,220,140,0.8); }
 	.spinner { width:10px; height:10px; border:1.5px solid rgba(255,255,255,0.2); border-top-color:rgba(255,255,255,0.8); border-radius:50%; animation:spin 0.7s linear infinite; }
