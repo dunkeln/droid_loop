@@ -5,10 +5,10 @@
 	import EpisodesSidebar from '$lib/components/EpisodesSidebar.svelte';
 	import ChatLog from '$lib/components/ChatLog.svelte';
 
-	const API  = 'http://localhost:8000/api';
+	const API  = '/api';
 	const FURL = (ep: number, fi: number) => `${API}/frames/${ep}_${fi}.jpg`;
 	const mediaUrl = (raw: string, rev = Date.now()) => {
-		const base = raw.startsWith('http') ? raw : `http://localhost:8000${raw}`;
+		const base = raw.startsWith('http') ? raw : raw;
 		return `${base}${base.includes('?') ? '&' : '?'}rev=${rev}`;
 	};
 
@@ -378,7 +378,7 @@
 				const views: FrameView[] = r.ok ? await r.json() : [];
 				const mapped = views.map((v) => ({
 					camera: v.camera,
-					frame_url: v.frame_url.startsWith('http') ? v.frame_url : `http://localhost:8000${v.frame_url}`
+					frame_url: v.frame_url
 				}));
 				const fallback = [{ camera: 'primary', frame_url: FURL(m.episode_id, m.frame_index) }];
 				if (req === detailViewsReq) detailViews = mapped.length > 0 ? mapped : fallback;
@@ -404,7 +404,7 @@
 				scanFrameDisplay = { ...scanFrameDisplay, ...group };
 				// Keep displayFrame in sync for any code still referencing it
 				const primaryUrl = Object.values(group)[0];
-				if (primaryUrl) displayFrame = `http://localhost:8000${primaryUrl.startsWith('/') ? primaryUrl : '/' + primaryUrl}`;
+				if (primaryUrl) displayFrame = primaryUrl.startsWith('/') ? primaryUrl : `/${primaryUrl}`;
 			} else if (frameBuf.length > 0) {
 				displayFrame = frameBuf[0];
 				frameBuf = frameBuf.slice(1);
@@ -792,7 +792,7 @@
 	// ── Scan ──────────────────────────────────────────────────────────────────
 	function handleScanEvent(e: SseEvent) {
 		if (e.type === 'episode_frames') {
-			const urls = (e.frame_urls ?? []).map(u => `http://localhost:8000${u}`);
+			const urls = (e.frame_urls ?? []).map(u => u);
 			if (e.preview_groups && e.preview_groups.length > 0) {
 				scanFrameGroups = [...scanFrameGroups, ...e.preview_groups];
 			} else {
@@ -826,7 +826,7 @@
 				};
 			}
 		} else if (e.type === 'frame') {
-			const url = `http://localhost:8000${e.frame_url}`;
+			const url = e.frame_url!;
 			const clip = clips.get(e.episode_id!);
 			if (clip) {
 				clip.flagged = [...clip.flagged, {
@@ -1530,7 +1530,7 @@
 	function primaryScanFrameUrl(): string {
 		const primary = Object.values(scanFrameDisplay)[0] ?? displayFrame;
 		if (!primary) return '';
-		return primary.startsWith('http') ? primary : `http://localhost:8000${primary}`;
+		return primary;
 	}
 
 	function primaryScanVideoUrl(): string {
@@ -1933,7 +1933,7 @@
 									{#if frameUrl}
 										<div class="scan-camera-overlay">
 											<img
-												src={frameUrl.startsWith('http') ? frameUrl : `http://localhost:8000${frameUrl}`}
+												src={frameUrl}
 												alt=""
 												class="scan-camera-video"
 											/>

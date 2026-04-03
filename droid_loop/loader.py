@@ -12,6 +12,7 @@ columns (joint states, actions, metadata). This module stitches them together:
 """
 
 import json
+import logging
 from collections.abc import Iterator
 from dataclasses import dataclass
 from pathlib import Path
@@ -23,6 +24,7 @@ from PIL import Image
 from pyarrow import parquet as pq
 
 DROID_DATASET = "lerobot/droid_1.0.1"
+logger = logging.getLogger("droid_loop.loader")
 
 # Fallback camera keys — overridden by meta/info.json when available
 _DEFAULT_IMAGE_KEYS = [
@@ -43,6 +45,12 @@ class VideoRef:
 _episode_video_index_cache: dict[str, dict[int, dict[str, VideoRef]]] = {}
 
 
+def _log_loader_event(event: str, level: str = "info", **fields) -> None:
+    payload = {"component": "loader", "event": event, **fields}
+    log_fn = logger.warning if level == "warning" else logger.info
+    log_fn(json.dumps(payload, default=str))
+
+
 def dataset_fps(dataset_id: str = DROID_DATASET) -> float:
     """Return dataset FPS from metadata (falls back to 15)."""
     meta = _load_meta(dataset_id)
@@ -61,20 +69,34 @@ def _load_meta(dataset_id: str) -> dict:
             filename="meta/info.json",
         )
         meta = json.loads(Path(local).read_text())
-        # Print key structural fields so we can verify path assumptions
-        print(f"[loader] info.json keys: {list(meta.keys())}")
-        print(f"[loader] episodes_per_chunk: {meta.get('episodes_per_chunk')}")
-        print(f"[loader] total_episodes: {meta.get('total_episodes')}")
+        # Emit structural fields once so path assumptions are observable in logs.
         vid_features = {k: v for k, v in meta.get("features", {}).items()
                         if isinstance(v, dict) and v.get("_type") == "VideoFrame"}
-        print(f"[loader] VideoFrame features: {list(vid_features.keys())}")
-        # Print path template if present inside any VideoFrame feature
+        path_templates = {
+            k: v["path"]
+            for k, v in vid_features.items()
+            if "path" in v
+        }
+        _log_loader_event(
+            "meta_loaded",
+            dataset_id=dataset_id,
+            info_keys=list(meta.keys()),
+            episodes_per_chunk=meta.get("episodes_per_chunk"),
+            total_episodes=meta.get("total_episodes"),
+            video_frame_features=list(vid_features.keys()),
+            path_templates=path_templates,
+        )
         for k, v in vid_features.items():
             if "path" in v:
-                print(f"[loader] path template ({k}): {v['path']}")
+                continue
         return meta
     except Exception as e:
-        print(f"[loader] could not load meta/info.json ({e}), using defaults")
+        _log_loader_event(
+            "meta_load_failed",
+            level="warning",
+            dataset_id=dataset_id,
+            error=str(e),
+        )
         return {}
 
 
@@ -171,7 +193,7 @@ def _load_episode_video_index(dataset_id: str) -> dict[int, dict[str, VideoRef]]
             index[episode_id] = refs
 
     _episode_video_index_cache[dataset_id] = index
-    print(f"[loader] episode video index loaded: {len(index)} episodes")
+    _log_loader_event("episode_video_index_loaded", dataset_id=dataset_id, episode_count=len(index))
     return index
 
 
@@ -196,7 +218,12 @@ def _fetch_episode_videos(
     index = _load_episode_video_index(dataset_id)
     refs = index.get(episode_id)
     if refs is None:
-        print(f"[loader] warning: no episode metadata for episode_id={episode_id}")
+        _log_loader_event(
+            "episode_metadata_missing",
+            level="warning",
+            dataset_id=dataset_id,
+            episode_id=episode_id,
+        )
         return decoded
 
     for key in image_keys:
@@ -218,21 +245,37 @@ def _fetch_episode_videos(
                 end_seconds=ref.to_timestamp,
                 fps_hint=fps,
             )
-            print(
-                f"[loader] ep {episode_id} {key}: {len(decoded[key])} frames "
-                f"(chunk-{ref.chunk_index:03d}/file-{ref.file_index:03d})"
+            _log_loader_event(
+                "episode_camera_loaded",
+                dataset_id=dataset_id,
+                episode_id=episode_id,
+                image_key=key,
+                frame_count=len(decoded[key]),
+                chunk_index=ref.chunk_index,
+                file_index=ref.file_index,
             )
         except Exception as exc:
             missing_keys.append(key)
-            print(
-                f"[loader] warning: could not load {key} for ep {episode_id} "
-                f"(chunk-{ref.chunk_index:03d}/file-{ref.file_index:03d}): {exc}"
+            _log_loader_event(
+                "episode_camera_load_failed",
+                level="warning",
+                dataset_id=dataset_id,
+                episode_id=episode_id,
+                image_key=key,
+                chunk_index=ref.chunk_index,
+                file_index=ref.file_index,
+                error=str(exc),
             )
 
     if missing_keys:
-        print(
-            f"[loader] ep {episode_id}: missing {len(missing_keys)}/{len(image_keys)} camera files "
-            f"({', '.join(missing_keys)})"
+        _log_loader_event(
+            "episode_camera_subset_missing",
+            level="warning",
+            dataset_id=dataset_id,
+            episode_id=episode_id,
+            missing_count=len(missing_keys),
+            requested_count=len(image_keys),
+            missing_keys=missing_keys,
         )
     return decoded
 
@@ -254,9 +297,15 @@ def stream_episodes(
     image_keys = [_normalize_image_key(k) for k in selected_keys]
     fps = float(meta.get("fps", 15))
 
-    print(f"[loader] {dataset_id}")
-    print(f"[loader] image keys  : {image_keys}")
-    print(f"[loader] fps         : {fps}")
+    _log_loader_event(
+        "stream_start",
+        dataset_id=dataset_id,
+        split=split,
+        image_keys=image_keys,
+        fps=fps,
+        start_episode=start_episode,
+        max_episodes=max_episodes,
+    )
 
     # Stream scalar rows grouped by episode
     ds = load_dataset(dataset_id, split=split, streaming=True)

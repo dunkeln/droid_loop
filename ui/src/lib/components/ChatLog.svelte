@@ -1,7 +1,7 @@
 <script lang="ts">
 	import { onDestroy } from 'svelte';
 
-	const API = 'http://localhost:8000/api';
+	const API = '/api';
 
 	type ChatCitation = {
 		episode_id: number;
@@ -73,7 +73,7 @@
 	}
 
 	function frameUrl(raw: string): string {
-		return raw.startsWith('http') ? raw : `http://localhost:8000${raw}`;
+		return raw;
 	}
 
 	function cameraLabel(camera: string): string {

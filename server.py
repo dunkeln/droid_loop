@@ -1,4 +1,5 @@
 import json
+import logging
 import queue
 import re
 import subprocess
@@ -22,11 +23,13 @@ from droid_loop.scorer import FrameScorer
 from droid_loop.vlm_query import MODEL_ID as VLM_MODEL_ID, query_incident
 
 SERVER_ROOT = Path(__file__).resolve().parent
+UI_BUILD_DIR = SERVER_ROOT / "ui" / "build"
+logger = logging.getLogger("droid_loop.server")
 
 # Absolute runtime paths anchored to the repo so they do not depend on cwd.
 FRAMES_DIR = SERVER_ROOT / "frames"
 FRAMES_DIR.mkdir(exist_ok=True)
-print(f"[droid-loop] frames dir: {FRAMES_DIR}")
+logger.info(json.dumps({"component": "server", "event": "frames_dir_ready", "path": str(FRAMES_DIR)}))
 
 app = FastAPI(title="DROID Loop API")
 
@@ -288,7 +291,17 @@ def _join_worker_threads(timeout_s: float = 1.5) -> None:
 
 def _log_scan_event(event: str, **fields) -> None:
     payload = {"component": "scan", "event": event, **fields}
-    print(json.dumps(payload, default=str))
+    logger.info(json.dumps(payload, default=str))
+
+
+def _log_server_event(event: str, level: str = "info", **fields) -> None:
+    payload = {"component": "server", "event": event, **fields}
+    log_fn = logger.warning if level == "warning" else logger.info
+    log_fn(json.dumps(payload, default=str))
+
+
+def _log_vlm_event(event: str, **fields) -> None:
+    logger.info(json.dumps({"component": "vlm", "event": event, **fields}, default=str))
 
 
 def _rss_mb() -> float:
@@ -714,7 +727,11 @@ def _resolve_image_key(frame: dict, preferred: str) -> str | None:
     # Last resort: any key whose value is a numpy array or PIL Image
     detected = _find_image_keys(frame)
     if detected:
-        print(f"[scan] using auto-detected image key: {detected[0]!r}  (all: {detected})")
+        _log_scan_event(
+            "auto_detected_image_key",
+            selected_key=detected[0],
+            detected_keys=detected,
+        )
         return detected[0]
     return None
 
@@ -1579,23 +1596,18 @@ def vlm_query(payload: VlmQueryRequest):
     _vlm_token_totals["input_tokens"] += int(result.input_tokens)
     _vlm_token_totals["output_tokens"] += int(result.output_tokens)
     _vlm_token_totals["total_tokens"] = _vlm_token_totals["input_tokens"] + _vlm_token_totals["output_tokens"]
-    print(
-        json.dumps(
-            {
-                "component": "vlm",
-                "event": "query",
-                "episode_id": payload.episode_id,
-                "frame_index": target_frame_index,
-                "resolved_clip_id": (resolved_clip or {}).get("id"),
-                "model": payload.model_id,
-                "attempts": result.attempts,
-                "history_tokens_est": history_tokens,
-                "history_compacted": history_compacted,
-                "input_tokens": int(result.input_tokens),
-                "output_tokens": int(result.output_tokens),
-                "accumulated_total_tokens": int(_vlm_token_totals["total_tokens"]),
-            }
-        )
+    _log_vlm_event(
+        "query",
+        episode_id=payload.episode_id,
+        frame_index=target_frame_index,
+        resolved_clip_id=(resolved_clip or {}).get("id"),
+        model=payload.model_id,
+        attempts=result.attempts,
+        history_tokens_est=history_tokens,
+        history_compacted=history_compacted,
+        input_tokens=int(result.input_tokens),
+        output_tokens=int(result.output_tokens),
+        accumulated_total_tokens=int(_vlm_token_totals["total_tokens"]),
     )
 
     response = {
@@ -1661,7 +1673,10 @@ def _run_scan(params: ScanParams) -> None:
             already_scanned = catalog.get_scanned_episode_ids()
             queued_new_episodes = 0
             if already_scanned:
-                print(f"[droid-loop] resuming — {len(already_scanned)} episodes already scanned, skipping")
+                _log_server_event(
+                    "scan_resume_detected",
+                    already_scanned_episodes=len(already_scanned),
+                )
             effective_start_episode = int(params.start_episode)
             while effective_start_episode in already_scanned:
                 effective_start_episode += 1
@@ -1712,8 +1727,11 @@ def _run_scan(params: ScanParams) -> None:
                         logged_keys = True
                         all_keys = list(episode[0].keys())
                         img_keys = _find_image_keys(episode[0])
-                        print(f"[scan] frame keys: {all_keys}")
-                        print(f"[scan] detected image keys: {img_keys}")
+                        _log_scan_event(
+                            "frame_schema_detected",
+                            frame_keys=all_keys,
+                            detected_image_keys=img_keys,
+                        )
 
                     image_key = _resolve_image_key(episode[0], params.image_key)
                     if image_key is None:
@@ -1778,10 +1796,13 @@ def _run_scan(params: ScanParams) -> None:
                     # can show all camera angles in sync during scan playback.
                     step = 1  # stream every frame as a preview
                     preview_groups: list[dict[str, str]] = []
-                    print(
-                        f"[scan] ep {episode_id}: {len(valid)} frames, saving multi-cam "
-                        f"previews (step={step}, cameras={[_camera_tag(k) for k in camera_keys]}) "
-                        f"to {FRAMES_DIR}"
+                    _log_scan_event(
+                        "saving_preview_frames",
+                        episode_id=episode_id,
+                        frame_count=len(valid),
+                        preview_step=step,
+                        cameras=[_camera_tag(k) for k in camera_keys],
+                        frames_dir=str(FRAMES_DIR),
                     )
                     for ep_i in range(0, len(valid), step):
                         fi = frame_indices[ep_i]
@@ -2246,3 +2267,28 @@ def on_shutdown() -> None:
     catalog.close_all()
     _cleanup_runtime_state()
     _cleanup_artifacts()
+
+
+@app.get("/")
+def serve_index():
+    index_path = UI_BUILD_DIR / "index.html"
+    if not index_path.exists():
+        raise HTTPException(404, "frontend build not found")
+    return FileResponse(index_path)
+
+
+@app.get("/{full_path:path}")
+def serve_frontend(full_path: str):
+    if full_path.startswith("api/"):
+        raise HTTPException(404, "not found")
+    asset_path = (UI_BUILD_DIR / full_path).resolve()
+    try:
+        asset_path.relative_to(UI_BUILD_DIR.resolve())
+    except ValueError as exc:
+        raise HTTPException(404, "not found") from exc
+    if asset_path.exists() and asset_path.is_file():
+        return FileResponse(asset_path)
+    index_path = UI_BUILD_DIR / "index.html"
+    if index_path.exists():
+        return FileResponse(index_path)
+    raise HTTPException(404, "frontend build not found")
