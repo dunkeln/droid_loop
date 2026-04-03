@@ -3,6 +3,7 @@ from __future__ import annotations
 import base64
 import io
 import json
+import os
 from dataclasses import dataclass
 
 import anthropic
@@ -10,7 +11,7 @@ from dotenv import find_dotenv, load_dotenv
 from PIL import Image
 from pydantic import BaseModel, Field
 
-MODEL_ID = "claude-haiku-4-5-20251001"
+MODEL_ID = os.getenv("DROID_VLM_MODEL", "claude-sonnet-4-5-20250929")
 
 load_dotenv(find_dotenv())
 
@@ -18,6 +19,8 @@ load_dotenv(find_dotenv())
 class VlmIncidentResult(BaseModel):
     incident_type: str = Field(min_length=1)
     failure_mode: str = Field(min_length=1)
+    task_phase: str = Field(min_length=1)
+    cause_hypothesis: str = Field(min_length=1)
     confidence: float = Field(ge=0.0, le=1.0)
     summary: str = Field(min_length=1)
     evidence_frame_indices: list[int] = Field(default_factory=list)
@@ -112,20 +115,31 @@ def _prompt_schema(user_query: str | None, clip_metadata: dict | None = None) ->
     return (
         f"{context_block} "
         "You are evaluating robot behavior for safety, task correctness, and unintended failure. "
+        "Reason causally across the whole clip, not just the most salient frame. "
+        "First infer the intended task phase: approach, grasp, lift, transport, place, release, or recovery. "
+        "Then identify the key transition in the clip: what changed from before to during to after. "
         "Do not assume that contact, grasping, lifting, transport, or placement is bad by default. "
         "These are often normal robot actions. "
         "Only call something an incident if the frames show evidence of unsafe, unintended, abnormal, "
         "or task-breaking behavior such as collision, drop, spill, slip, misgrasp, object damage, "
         "wrong-object interaction, unstable motion, or contact that is clearly inappropriate in context. "
+        "Distinguish intended release/placement from accidental release. "
+        "If an object moves from controlled grasp to uncontrolled motion, prefer incident types like "
+        "object_drop, object_slip, or loss_of_grasp over generic contact descriptions. "
+        "Do not label a normal grasp as bad if the actual failure is a later loss of control. "
+        "Prefer the primary causal failure over intermediate contact. "
         "If the behavior looks like normal planned manipulation and there is no clear evidence of failure, "
         'set "incident_type" to "none", set "failure_mode" to "none", explain briefly why the action appears '
-        'normal in "summary", set "actionability" to "no issue visible", and keep "recommendations" empty. '
+        'normal in "summary", set "task_phase" to the best matching phase, set "cause_hypothesis" to "none", '
+        'set "actionability" to "no issue visible", and keep "recommendations" empty. '
         "Prefer being conservative: do not label a routine grasp as bad unless the visual evidence supports that conclusion. "
         "Focus on cause and consequence, not mere motion or contact. "
         "Return ONLY one JSON object with keys exactly:\n"
         "{"
         '"incident_type": string,'
         '"failure_mode": string,'
+        '"task_phase": string,'
+        '"cause_hypothesis": string,'
         '"confidence": number_between_0_and_1,'
         '"summary": string,'
         '"evidence_frame_indices": array_of_integers,'
@@ -148,6 +162,8 @@ def _tool_spec() -> dict:
             "properties": {
                 "incident_type": {"type": "string"},
                 "failure_mode": {"type": "string"},
+                "task_phase": {"type": "string"},
+                "cause_hypothesis": {"type": "string"},
                 "confidence": {"type": "number", "minimum": 0, "maximum": 1},
                 "summary": {"type": "string"},
                 "evidence_frame_indices": {
@@ -165,6 +181,8 @@ def _tool_spec() -> dict:
             "required": [
                 "incident_type",
                 "failure_mode",
+                "task_phase",
+                "cause_hypothesis",
                 "confidence",
                 "summary",
                 "evidence_frame_indices",
@@ -186,6 +204,44 @@ def _extract_tool_payload(response: object, tool_name: str) -> dict | None:
             if isinstance(data, dict):
                 return data
     return None
+
+
+def _run_structured_pass(
+    *,
+    client: anthropic.Anthropic,
+    content: list[dict],
+    prompt_text: str,
+    model_id: str,
+    temperature: float,
+    use_tools: bool,
+) -> tuple[VlmIncidentResult, str, int, int]:
+    req_kwargs: dict = {
+        "model": model_id,
+        "max_tokens": 450,
+        "temperature": temperature,
+        "messages": [
+            {
+                "role": "user",
+                "content": [*content, {"type": "text", "text": prompt_text}],
+            }
+        ],
+    }
+    if use_tools:
+        req_kwargs["tools"] = [_tool_spec()]
+        req_kwargs["tool_choice"] = {"type": "tool", "name": "respond_incident_json"}
+    response = client.messages.create(**req_kwargs)
+    in_tok, out_tok = _usage_tokens(response)
+    if use_tools:
+        tool_payload = _extract_tool_payload(response, "respond_incident_json")
+        if isinstance(tool_payload, dict):
+            result = VlmIncidentResult.model_validate(tool_payload)
+            return result, json.dumps(tool_payload), in_tok, out_tok
+    raw_text = "\n".join(
+        block.text for block in response.content if hasattr(block, "text")
+    ).strip()
+    obj = json.loads(_extract_json_object(raw_text))
+    result = VlmIncidentResult.model_validate(obj)
+    return result, raw_text, in_tok, out_tok
 
 
 def query_incident(
@@ -226,17 +282,11 @@ def query_incident(
     history_text = "\n".join(
         f"{m.get('role', 'user')}: {m.get('content', '')}" for m in history if m.get("content")
     )
-    content.append(
-        {
-            "type": "text",
-            "text": (
-                _prompt_schema(user_query, clip_metadata=clip_metadata)
-                + "\nFrame metadata in order: ["
-                + frame_table
-                + "]"
-                + ("\nPrior chat context:\n" + history_text if history_text else "")
-            ),
-        }
+    base_prompt_suffix = (
+        "\nFrame metadata in order: ["
+        + frame_table
+        + "]"
+        + ("\nPrior chat context:\n" + history_text if history_text else "")
     )
 
     attempts = 0
@@ -245,42 +295,18 @@ def query_incident(
     total_in_tok = 0
     total_out_tok = 0
     for _ in range(max(1, max_retries) + 1):
-        attempts += 1
-        req_kwargs: dict = {
-            "model": model_id,
-            "max_tokens": 450,
-            "temperature": temperature,
-            "messages": [{"role": "user", "content": content}],
-        }
-        if use_tools:
-            req_kwargs["tools"] = [_tool_spec()]
-            req_kwargs["tool_choice"] = {"type": "tool", "name": "respond_incident_json"}
-        response = client.messages.create(**req_kwargs)
-        in_tok, out_tok = _usage_tokens(response)
-        total_in_tok += in_tok
-        total_out_tok += out_tok
-        if use_tools:
-            tool_payload = _extract_tool_payload(response, "respond_incident_json")
-            if isinstance(tool_payload, dict):
-                try:
-                    result = VlmIncidentResult.model_validate(tool_payload)
-                    return VlmQueryOutput(
-                        result=result,
-                        raw_text=json.dumps(tool_payload),
-                        attempts=attempts,
-                        input_tokens=total_in_tok,
-                        output_tokens=total_out_tok,
-                    )
-                except Exception as exc:
-                    last_error = str(exc)
-                    continue
-        raw_text = "\n".join(
-            block.text for block in response.content if hasattr(block, "text")
-        ).strip()
-        last_raw = raw_text
         try:
-            obj = json.loads(_extract_json_object(raw_text))
-            result = VlmIncidentResult.model_validate(obj)
+            attempts += 1
+            result, raw_text, in_tok, out_tok = _run_structured_pass(
+                client=client,
+                content=content,
+                prompt_text=_prompt_schema(user_query, clip_metadata=clip_metadata) + base_prompt_suffix,
+                model_id=model_id,
+                temperature=temperature,
+                use_tools=use_tools,
+            )
+            total_in_tok += in_tok
+            total_out_tok += out_tok
             return VlmQueryOutput(
                 result=result,
                 raw_text=raw_text,
@@ -290,5 +316,6 @@ def query_incident(
             )
         except Exception as exc:
             last_error = str(exc)
+            last_raw = repr(exc)
             continue
     raise ValueError(f"failed to parse valid VLM JSON after {attempts} attempts: {last_error}; raw={last_raw[:300]!r}")

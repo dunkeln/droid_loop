@@ -11,7 +11,7 @@ from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, StreamingResponse
-from PIL import Image
+from PIL import Image, ImageDraw
 from pydantic import BaseModel
 
 load_dotenv()
@@ -985,6 +985,114 @@ def _downsample_ordered_frames(frames: list[dict], max_frames: int | None) -> li
     return selected
 
 
+def _select_vlm_query_frames(
+    frames: list[dict],
+    anchor_frame_index: int,
+    max_frames: int | None,
+) -> list[dict]:
+    if max_frames is None or max_frames <= 0 or len(frames) <= max_frames:
+        return frames
+    if max_frames == 1:
+        return [min(frames, key=lambda f: abs(int(f.get("frame_index", 0)) - anchor_frame_index))]
+
+    ordered = list(frames)
+    anchor_pos = min(
+        range(len(ordered)),
+        key=lambda i: abs(int(ordered[i].get("frame_index", 0)) - anchor_frame_index),
+    )
+
+    chosen: list[int] = []
+
+    def add(pos: int) -> None:
+        if 0 <= pos < len(ordered) and pos not in chosen:
+            chosen.append(pos)
+
+    # Hard-anchor the sequence with explicit before/during/after evidence.
+    for pos in (
+        0,
+        anchor_pos,
+        len(ordered) - 1,
+        anchor_pos - 1,
+        anchor_pos + 1,
+        anchor_pos - 2,
+        anchor_pos + 2,
+        anchor_pos - 3,
+        anchor_pos + 3,
+        anchor_pos + 4,
+        anchor_pos + 5,
+        anchor_pos - 4,
+    ):
+        add(pos)
+        if len(chosen) >= max_frames:
+            break
+
+    if len(chosen) < max_frames:
+        before = list(range(0, anchor_pos))
+        after = list(range(anchor_pos + 1, len(ordered)))
+        # Bias slightly toward aftermath to make slips/drops easier to see.
+        interleave: list[int] = []
+        max_side = max(len(before), len(after))
+        for i in range(max_side):
+            if i < len(after):
+                interleave.append(after[i])
+            if i < len(before):
+                interleave.append(before[-(i + 1)])
+        for pos in interleave:
+            add(pos)
+            if len(chosen) >= max_frames:
+                break
+
+    if len(chosen) < max_frames:
+        for pos in range(len(ordered)):
+            add(pos)
+            if len(chosen) >= max_frames:
+                break
+
+    return [ordered[i] for i in sorted(chosen)]
+
+
+def _compose_multiview_frame(
+    episode_id: int,
+    frame_index: int,
+    views: list[dict[str, str]],
+) -> Image.Image | None:
+    opened: list[tuple[str, Image.Image]] = []
+    for view in views[:3]:
+        frame_url = view.get("frame_url")
+        camera = str(view.get("camera", "primary"))
+        if not isinstance(frame_url, str):
+            continue
+        filename = frame_url.rsplit("/", 1)[-1]
+        image_path = FRAMES_DIR / filename
+        if not image_path.exists():
+            continue
+        with Image.open(image_path) as img:
+            opened.append((camera, img.convert("RGB")))
+
+    if not opened:
+        return None
+    if len(opened) == 1:
+        return opened[0][1]
+
+    base_height = min(img.height for _, img in opened)
+    label_h = 20
+    resized: list[tuple[str, Image.Image]] = []
+    for camera, img in opened:
+        width = max(1, round(img.width * (base_height / img.height)))
+        resized.append((camera, img.resize((width, base_height))))
+
+    total_width = sum(img.width for _, img in resized)
+    canvas = Image.new("RGB", (total_width, base_height + label_h), color=(0, 0, 0))
+    draw = ImageDraw.Draw(canvas)
+    x = 0
+    for camera, img in resized:
+        canvas.paste(img, (x, label_h))
+        draw.rectangle((x, 0, x + img.width, label_h), fill=(8, 8, 8))
+        draw.text((x + 6, 4), camera.replace("_", " "), fill=(245, 245, 245))
+        x += img.width
+    return canvas
+
+
 def _estimate_tokens(text: str) -> int:
     # Lightweight heuristic for context budgeting.
     return max(1, len(text) // 4)
@@ -1092,7 +1200,11 @@ def _build_clip_frames_payload(
 
     if not ordered_frames:
         raise HTTPException(status_code=404, detail="Clip frames could not be materialized")
-    ordered_frames = _downsample_ordered_frames(ordered_frames, max_frames=max_frames)
+    ordered_frames = _select_vlm_query_frames(
+        ordered_frames,
+        anchor_frame_index=int(frame_index),
+        max_frames=max_frames,
+    )
 
     return {
         "episode_id": int(episode_id),
@@ -1349,7 +1461,7 @@ class VlmQueryRequest(BaseModel):
     target_clip_id: str | None = None
     resolve_clip_refs: bool = True
     model_id: str = VLM_MODEL_ID
-    max_frames: int = 12
+    max_frames: int = 20
     max_retries: int = 2
     temperature: float = 0.0
     use_tools: bool = True
@@ -1434,15 +1546,14 @@ def vlm_query(payload: VlmQueryRequest):
         views = frame.get("views", [])
         if not views:
             continue
-        frame_url = views[0].get("frame_url")
-        if not isinstance(frame_url, str):
+        composed = _compose_multiview_frame(
+            episode_id=payload.episode_id,
+            frame_index=int(frame["frame_index"]),
+            views=views,
+        )
+        if composed is None:
             continue
-        filename = frame_url.rsplit("/", 1)[-1]
-        image_path = FRAMES_DIR / filename
-        if not image_path.exists():
-            continue
-        with Image.open(image_path) as opened:
-            images.append(opened.convert("RGB"))
+        images.append(composed)
         frame_indices.append(int(frame["frame_index"]))
         timestamps_s.append(float(frame["timestamp_s"]))
 

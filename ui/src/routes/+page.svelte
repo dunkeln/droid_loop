@@ -48,6 +48,7 @@
 		type: 'episode_frames'|'frame'|'progress'|'done'|'error'|'ping';
 		episode_id?: number; frame_index?: number; cluster_id?: number;
 		cluster_size?: number; frame_url?: string; frame_urls?: string[];
+		incident_span?: number[];
 		preview_groups?: Array<Record<string, string>>;  // per-camera frames per step
 		video_url?: string;
 		camera_videos?: Record<string, string>;
@@ -831,6 +832,26 @@
 				clip.flagged = [...clip.flagged, {
 					frame_index: e.frame_index!, cluster_id: e.cluster_id!, frame_url: url,
 				}];
+				const existingMoment = clip.moments.find((m) => m.frame_index === e.frame_index!);
+				if (existingMoment) {
+					existingMoment.cluster_id = e.cluster_id!;
+					existingMoment.cluster_size = e.cluster_size;
+					existingMoment.incident_span = e.incident_span;
+				} else {
+					clip.moments = [
+						...clip.moments,
+						{
+							episode_id: e.episode_id!,
+							frame_index: e.frame_index!,
+							cluster_id: e.cluster_id!,
+							cluster_size: e.cluster_size,
+							cluster_span: [],
+							context_window: [],
+							incident_span: e.incident_span,
+							label: 'anomaly'
+						}
+					];
+				}
 				clips = new Map(clips);
 			}
 		} else if (e.type === 'progress') {
@@ -1609,7 +1630,7 @@
 				incident: data.incident?.trim() || null,
 				citation: {
 					episode_id: payload.episode_id,
-					frame_index: payload.frame_index,
+					frame_index: currentClipRef?.anchor_frame_index ?? payload.frame_index,
 					frame_start: currentClipRef?.start_frame_index ?? payload.frame_index,
 					frame_end: currentClipRef?.end_frame_index ?? payload.frame_index,
 					camera: payload.camera,

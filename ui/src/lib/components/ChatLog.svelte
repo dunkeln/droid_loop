@@ -57,6 +57,10 @@
 		return `${citation.episode_id}:${citation.frame_start ?? citation.frame_index}:${citation.frame_end ?? citation.frame_index}`;
 	}
 
+	function messagePreviewKey(msg: ChatTurn, idx: number): string {
+		return `${msg.ts}-${idx}`;
+	}
+
 	function clipStatus(status?: string): string | null {
 		if (!status) return null;
 		const value = status.trim();
@@ -98,14 +102,14 @@
 		stopPreviewTimer();
 	});
 
-	async function togglePreview(citation: ChatCitation) {
+	async function togglePreview(citation: ChatCitation, messageKey: string) {
 		const key = citationKey(citation);
-		if (openPreviewKey === key) {
+		if (openPreviewKey === messageKey) {
 			openPreviewKey = null;
 			stopPreviewTimer();
 			return;
 		}
-		openPreviewKey = key;
+		openPreviewKey = messageKey;
 		startPreviewTimer();
 		if (previewCache[key] || previewLoading[key]) return;
 		previewLoading = { ...previewLoading, [key]: true };
@@ -188,7 +192,7 @@
 								{#if msg.citation || clipStatus(msg.status)}
 									<div class="chat-meta-row">
 										{#if msg.citation}
-											<button class="chat-citation" onclick={() => togglePreview(msg.citation!)}>
+											<button class="chat-citation" onclick={() => togglePreview(msg.citation!, messagePreviewKey(msg, idx))}>
 												episode {msg.citation.episode_id}
 												{#if msg.citation.frame_start !== undefined && msg.citation.frame_end !== undefined}
 													· frames {msg.citation.frame_start}-{msg.citation.frame_end}
@@ -204,7 +208,7 @@
 								{/if}
 								{#if msg.citation}
 									{@const key = citationKey(msg.citation)}
-									{#if openPreviewKey === key}
+									{#if openPreviewKey === messagePreviewKey(msg, idx)}
 										<div class="chat-preview-shell">
 											{#if previewLoading[key]}
 												<p class="chat-preview-empty">loading clip…</p>
