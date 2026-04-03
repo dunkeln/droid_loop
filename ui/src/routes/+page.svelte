@@ -7,8 +7,13 @@
 
 	const API  = '/api';
 	const FURL = (ep: number, fi: number) => `${API}/frames/${ep}_${fi}.jpg`;
+	const normalizeAssetUrl = (raw: string) => {
+		if (!raw) return '';
+		if (raw.startsWith('http://') || raw.startsWith('https://')) return raw;
+		return raw.startsWith('/') ? raw : `/${raw}`;
+	};
 	const mediaUrl = (raw: string, rev = Date.now()) => {
-		const base = raw.startsWith('http') ? raw : raw;
+		const base = normalizeAssetUrl(raw);
 		return `${base}${base.includes('?') ? '&' : '?'}rev=${rev}`;
 	};
 
@@ -792,9 +797,17 @@
 	// ── Scan ──────────────────────────────────────────────────────────────────
 	function handleScanEvent(e: SseEvent) {
 		if (e.type === 'episode_frames') {
-			const urls = (e.frame_urls ?? []).map(u => u);
+			const urls = (e.frame_urls ?? []).map(normalizeAssetUrl).filter(Boolean);
 			if (e.preview_groups && e.preview_groups.length > 0) {
-				scanFrameGroups = [...scanFrameGroups, ...e.preview_groups];
+				const normalizedGroups = e.preview_groups.map((group) => {
+					const normalized: Record<string, string> = {};
+					for (const [camera, raw] of Object.entries(group)) {
+						const url = normalizeAssetUrl(raw);
+						if (url) normalized[camera] = url;
+					}
+					return normalized;
+				}).filter((group) => Object.keys(group).length > 0);
+				scanFrameGroups = [...scanFrameGroups, ...normalizedGroups];
 			} else {
 				frameBuf = [...frameBuf, ...urls];
 			}
@@ -826,7 +839,7 @@
 				};
 			}
 		} else if (e.type === 'frame') {
-			const url = e.frame_url!;
+			const url = normalizeAssetUrl(e.frame_url!);
 			const clip = clips.get(e.episode_id!);
 			if (clip) {
 				clip.flagged = [...clip.flagged, {
@@ -1530,7 +1543,7 @@
 	function primaryScanFrameUrl(): string {
 		const primary = Object.values(scanFrameDisplay)[0] ?? displayFrame;
 		if (!primary) return '';
-		return primary;
+		return normalizeAssetUrl(primary);
 	}
 
 	function primaryScanVideoUrl(): string {
@@ -1920,30 +1933,7 @@
 				{:else}
 				<!-- Camera view -->
 					<div class="camera-wrap">
-						{#if primaryScanFrameUrl()}
-							<img
-								src={primaryScanFrameUrl()}
-							alt=""
-							class="camera-frame"
-						/>
-						{#if scanning}<div class="rec-dot"></div>{/if}
-						{#if scanning && Object.keys(scanFrameDisplay).length > 1}
-							<div class="scan-camera-overlays">
-								{#each Object.entries(scanFrameDisplay).slice(1) as [camera, frameUrl] (camera)}
-									{#if frameUrl}
-										<div class="scan-camera-overlay">
-											<img
-												src={frameUrl}
-												alt=""
-												class="scan-camera-video"
-											/>
-											<span class="episode-overlay episode-camera-label scan-camera-label">{cameraLabel(camera)}</span>
-										</div>
-									{/if}
-								{/each}
-								</div>
-							{/if}
-						{:else if primaryScanVideoUrl()}
+						{#if primaryScanVideoUrl()}
 							<!-- svelte-ignore a11y_media_has_caption -->
 							<video
 								src={primaryScanVideoUrl()}
@@ -1972,6 +1962,29 @@
 											<span class="episode-overlay episode-camera-label scan-camera-label">{cameraLabel(camera)}</span>
 										</div>
 									{/each}
+								</div>
+							{/if}
+						{:else if primaryScanFrameUrl()}
+							<img
+								src={primaryScanFrameUrl()}
+							alt=""
+							class="camera-frame"
+						/>
+						{#if scanning}<div class="rec-dot"></div>{/if}
+						{#if scanning && Object.keys(scanFrameDisplay).length > 1}
+							<div class="scan-camera-overlays">
+								{#each Object.entries(scanFrameDisplay).slice(1) as [camera, frameUrl] (camera)}
+									{#if frameUrl}
+										<div class="scan-camera-overlay">
+											<img
+												src={frameUrl}
+												alt=""
+												class="scan-camera-video"
+											/>
+											<span class="episode-overlay episode-camera-label scan-camera-label">{cameraLabel(camera)}</span>
+										</div>
+									{/if}
+								{/each}
 								</div>
 							{/if}
 						{:else if activeClip && activeClip.flagged.length > 0}
