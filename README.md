@@ -18,6 +18,3 @@ uv sync
 uv run uvicorn server:app --host 127.0.0.1 --port 8000
 cd ui && npm install && npm run dev
 ```
-
-## Deploy
-Use [GUIDE.md](/Users/prateek/code/robotics/droid_loop/GUIDE.md) for the Lightsail VM flow.
